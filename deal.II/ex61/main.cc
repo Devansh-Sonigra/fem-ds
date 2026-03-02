@@ -44,6 +44,25 @@
 #include <deal.II/numerics/matrix_tools.h>
 #include <deal.II/numerics/data_postprocessor.h>
 
+#include <deal.II/numerics/error_estimator.h>
+#include <deal.II/numerics/solution_transfer.h>
+
+#include <deal.II/base/index_set.h>
+#include <deal.II/lac/trilinos_sparse_matrix.h>
+#include <deal.II/lac/trilinos_block_sparse_matrix.h>
+#include <deal.II/lac/trilinos_vector.h>
+#include <deal.II/lac/trilinos_parallel_block_vector.h>
+#include <deal.II/lac/trilinos_precondition.h>
+#include <deal.II/lac/trilinos_precondition.h>
+#include <deal.II/lac/trilinos_solver.h>
+#include <deal.II/lac/linear_operator_tools.h>
+#include <deal.II/base/mpi.h>
+ 
+#include <iostream>
+#include <fstream>
+#include <memory>
+#include <limits>
+
 #define DIRICHLET 1
 #define NEUMANN   2
 
@@ -212,10 +231,11 @@ private:
    AffineConstraints<double> constraints;
 
    BlockSparsityPattern      sparsity_pattern;
-   BlockSparseMatrix<double> system_matrix;
+std::vector<IndexSet>               partitioning;
+   TrilinosWrappers::BlockSparseMatrix system_matrix;
 
-   BlockVector<double> solution;
-   BlockVector<double> system_rhs;
+   TrilinosWrappers::MPI::BlockVector solution;
+   TrilinosWrappers::MPI::BlockVector system_rhs;
 };
 
 //------------------------------------------------------------------------------
@@ -277,8 +297,11 @@ MixedLaplaceProblem<dim>::setup_system()
 
    const std::vector<types::global_dof_index> dofs_per_component =
       DoFTools::count_dofs_per_fe_component(dof_handler);
-   const unsigned int n_c = dofs_per_component[0],
+   const types::global_dof_index  n_c = dofs_per_component[0],
                       n_p = dofs_per_component[dim];
+    partitioning.resize(2);
+    partitioning[0] = complete_index_set(n_c);
+    partitioning[1] = complete_index_set(n_p);
 
    std::cout << "Number of active cells: " << triangulation.n_active_cells()
              << std::endl
@@ -370,12 +393,14 @@ MixedLaplaceProblem<dim>::setup_system()
 
    const std::vector<types::global_dof_index> block_sizes = {n_c, n_p};
    BlockDynamicSparsityPattern                dsp(block_sizes, block_sizes);
-   DoFTools::make_sparsity_pattern(dof_handler, coupling, dsp, constraints);
-   sparsity_pattern.copy_from(dsp);
+   DoFTools::make_sparsity_pattern(dof_handler, coupling, dsp, constraints, false);
+   // sparsity_pattern.copy_from(dsp);
 
-   system_matrix.reinit(sparsity_pattern);
-   solution.reinit(block_sizes);
-   system_rhs.reinit(block_sizes);
+   std::cout << "hell" << std::endl;
+   system_matrix.reinit(dsp);
+   std::cout << "hell" << std::endl;
+   solution.reinit(partitioning, MPI_COMM_WORLD);
+   system_rhs.reinit(partitioning, MPI_COMM_WORLD);
 
    timer.stop();
    // double time_elapsed = timer.last_wall_time();
@@ -476,40 +501,81 @@ MixedLaplaceProblem<dim>::solve_schur(int&    phi_iteration,
 
    auto& U = solution.block(0);
    auto& P = solution.block(1);
+   std::cout << "hello world" << std::endl;
 
-   const auto op_M = linear_operator(M);
-   const auto op_B = linear_operator(B);
+   const auto op_M = linear_operator<TrilinosWrappers::MPI::Vector, TrilinosWrappers::MPI::Vector, TrilinosWrappers::internal::LinearOperatorImplementation::TrilinosPayload, TrilinosWrappers::SparseMatrix>(M);
+   const auto op_B = linear_operator<TrilinosWrappers::MPI::Vector, TrilinosWrappers::MPI::Vector, TrilinosWrappers::internal::LinearOperatorImplementation::TrilinosPayload, TrilinosWrappers::SparseMatrix>(B);
 
    ReductionControl         reduction_control_M(2000, 1.0e-18, 1.0e-10);
-   SolverCG<Vector<double>> solver_M(reduction_control_M);
-   PreconditionJacobi<SparseMatrix<double>> preconditioner_M;
+   TrilinosWrappers::SolverGMRES solver_M(reduction_control_M);
+   TrilinosWrappers::PreconditionJacobi preconditioner_M;
 
    preconditioner_M.initialize(M);
 
-   const auto op_M_inv = inverse_operator(op_M, solver_M, preconditioner_M);
+   const auto op_M_inv = inverse_operator< TrilinosWrappers::internal::LinearOperatorImplementation::TrilinosPayload,TrilinosWrappers::SolverGMRES, TrilinosWrappers::MPI::Vector, TrilinosWrappers::MPI::Vector>(op_M, solver_M, preconditioner_M);
+    // const auto op_M_inv = inverse_operator(op_M, solver_M, preconditioner_M);
 
    const auto op_S = transpose_operator(op_B) * op_M_inv * op_B;
+    // // 1. Explicitly wrap the preconditioner using M as the exemplar
+    // const auto op_precond_M = linear_operator<
+    //     TrilinosWrappers::MPI::Vector, 
+    //     TrilinosWrappers::MPI::Vector, 
+    //     TrilinosWrappers::internal::LinearOperatorImplementation::TrilinosPayload
+    // >(M, preconditioner_M);
+    //
+    // // 2. Now use the properly typed operator in your Schur complement definition
+    // const auto op_aS = transpose_operator(op_B) * op_precond_M * op_B;
    const auto op_aS =
-      transpose_operator(op_B) * linear_operator(preconditioner_M) * op_B;
+      transpose_operator(op_B) * linear_operator<TrilinosWrappers::MPI::Vector, TrilinosWrappers::MPI::Vector, TrilinosWrappers::internal::LinearOperatorImplementation::TrilinosPayload>(preconditioner_M) * op_B;
 
    IterationNumberControl   iteration_number_control_aS(30, 1.e-18);
-   SolverCG<Vector<double>> solver_aS(iteration_number_control_aS);
+   TrilinosWrappers::SolverGMRES solver_aS(iteration_number_control_aS);
 
+    // // Wrap identity preconditioner with proper Trilinos payload
+    // const auto op_identity = linear_operator<
+    //     TrilinosWrappers::MPI::Vector,
+    //     TrilinosWrappers::MPI::Vector,
+    //     TrilinosWrappers::internal::LinearOperatorImplementation::TrilinosPayload
+    // >(op_aS); // use op_aS as exemplar, gives identity-like operator
+    //
+    // const auto preconditioner_S =
+    //     inverse_operator<
+    //         TrilinosWrappers::internal::LinearOperatorImplementation::TrilinosPayload,
+    //         TrilinosWrappers::SolverGMRES,
+    //         TrilinosWrappers::MPI::Vector,
+    //         TrilinosWrappers::MPI::Vector
+    //     >(op_aS, solver_aS, op_identity);
    const auto preconditioner_S =
-      inverse_operator(op_aS, solver_aS, PreconditionIdentity());
+      inverse_operator< TrilinosWrappers::internal::LinearOperatorImplementation::TrilinosPayload,TrilinosWrappers::SolverGMRES, TrilinosWrappers::MPI::Vector, TrilinosWrappers::MPI::Vector>(op_aS, solver_aS);
 
-   const auto schur_rhs = transpose_operator(op_B) * op_M_inv * F - G;
+   std::cout << "hello world 3" << std::endl;
+   // const auto schur_rhs = transpose_operator(op_B) * op_M_inv * F - G;
+    // 1. Create a concrete vector with the exact same memory layout/size as G or P
+    TrilinosWrappers::MPI::Vector schur_rhs(G); 
+
+    // 2. Perform the assignment. This forces the expression to evaluate 
+    // immediately while all temporaries are still alive.
+    schur_rhs = transpose_operator(op_B) * op_M_inv * F - G;
+   // const TrilinosWrappers::MPI::Vector schur_rhs = transpose_operator(op_B) * op_M_inv * F - G;
+   std::cout << "hello world 4" << std::endl;
+   // const auto schur_rhs = transpose_operator(op_B) * op_M_inv * F;
+   // TrilinosWrappers::MPI::Vector temp1;
 
    SolverControl            solver_control_S(6000, 1.e-8);
-   SolverCG<Vector<double>> solver_S(solver_control_S);
+   TrilinosWrappers::SolverGMRES solver_S(solver_control_S);
 
-   const auto op_S_inv = inverse_operator(op_S, solver_S, preconditioner_S);
+   // const auto op_S_inv = inverse_operator< TrilinosWrappers::internal::LinearOperatorImplementation::TrilinosPayload,TrilinosWrappers::SolverGMRES, TrilinosWrappers::MPI::Vector, TrilinosWrappers::MPI::Vector>(op_S, solver_S, preconditioner_S);
+   const auto op_S_inv = inverse_operator< TrilinosWrappers::internal::LinearOperatorImplementation::TrilinosPayload,TrilinosWrappers::SolverGMRES, TrilinosWrappers::MPI::Vector, TrilinosWrappers::MPI::Vector>(op_S, solver_S, preconditioner_S);
 
    timer.start();
+   std::cout << "hello world 1" << std::endl;
+   std::cout << schur_rhs(0) << std::endl;
    P = op_S_inv * schur_rhs;
+   std::cout << "hello world 2" << std::endl;
    timer.stop();
    phi_time = timer.last_wall_time();
    phi_iteration = solver_control_S.last_step();
+   std::cout << phi_iteration<< std::endl;
 
    timer.start();
    U = op_M_inv * (F - op_B * P);
@@ -517,6 +583,103 @@ MixedLaplaceProblem<dim>::solve_schur(int&    phi_iteration,
    timer.stop();
    j_iteration = reduction_control_M.last_step();
    j_time = timer.last_wall_time();
+
+// const auto &M = system_matrix.block(0, 0);
+// const auto &B = system_matrix.block(0, 1);
+// auto &B_transpose = system_matrix.block(0, 1);
+// B_transpose.transpose();
+//
+// const auto &F = system_rhs.block(0);
+// const auto &G = system_rhs.block(1);
+//
+// auto &U = solution.block(0);
+// auto &P = solution.block(1);
+//
+// using Vec = TrilinosWrappers::MPI::Vector;
+//
+// const auto op_M = linear_operator<Vec, Vec>(M);
+// const auto op_B = linear_operator<Vec, Vec>(B);
+//
+// ReductionControl reduction_control_M(2000, 1.0e-18, 1.0e-10);
+//
+// TrilinosWrappers::SolverCG solver_M(reduction_control_M);
+// TrilinosWrappers::PreconditionJacobi preconditioner_M;
+//
+// preconditioner_M.initialize(M);
+//
+// // const auto op_M_inv =
+// //     inverse_operator(op_M, solver_M, preconditioner_M);
+// // const auto op_M_inv = linear_operator<Vec, Vec>(
+// //   [&](Vec &dst, const Vec &src) {
+// //     solver_M.solve(M, dst, src, preconditioner_M);
+// //   });
+// auto op_M_inv = linear_operator<Vec, Vec>(M);
+// op_M_inv.vmult = [&](Vec &dst, const Vec &src) {
+//     solver_M.solve(M, dst, src, preconditioner_M);
+//   };
+//
+// // Schur operator
+// const LinearOperator<Vec, Vec> op_S =
+//     transpose_operator(op_B) * op_M_inv * op_B;
+//
+// // Approximate Schur (for preconditioning)
+// const LinearOperator<Vec, Vec> op_aS =
+//     transpose_operator(op_B)
+//     * linear_operator<Vec, Vec>(preconditioner_M)
+//     * op_B;
+//
+// IterationNumberControl iteration_number_control_aS(30, 1.e-18);
+// TrilinosWrappers::SolverCG solver_aS(iteration_number_control_aS);
+//
+// const auto preconditioner_S =
+//     inverse_operator(op_aS,
+//                      solver_aS,
+//                      PreconditionIdentity());
+//
+// // Schur RHS
+// // auto tmp = op_M_inv * F;
+// TrilinosWrappers::MPI::Vector tmp;
+// tmp.reinit(solution);
+// solver_M.solve(M, tmp, F, preconditioner_M);
+//
+// // auto schur_rhs = transpose_operator(op_B) * tmp;
+// TrilinosWrappers::MPI::Vector schur_rhs;
+// schur_rhs.reinit(tmp);
+// // schur_rhs = B_transpose * tmp; 
+// B_transpose.vmult(schur_rhs, tmp);
+// schur_rhs -= G;
+//
+// SolverControl solver_control_S(6000, 1.e-8);
+// TrilinosWrappers::SolverGMRES solver_S(solver_control_S);
+//
+// // const auto op_S_inv =
+// //     inverse_operator(op_S, solver_S, preconditioner_S);
+// auto op_S_inv = linear_operator<Vec,Vec>(op_S);
+// op_S_inv.vmult = [&](Vec &dst, const Vec &src) {
+//     solver_S.solve(op_S, dst, src, preconditioner_S);
+// };
+//
+// // Solve Schur
+// // P = op_S_inv * schur_rhs;
+// // This effectively calls GMRES internally using the settings from op_S_inv
+// op_S_inv.vmult(P, schur_rhs);
+// // solver_S.solve(op_S, P, schur_rhs, preconditioner_S);
+// // TrilinosWrapper::MPI::Vector tmp_rhs;
+// // tmp_rhs.reinit(schur_rhs);
+// // tmp_rhs = B * schur_rhs;
+// // solver_M.solve(, P, schur_rhs, preconditioner_S);
+//
+// // Recover U
+// // auto tmp2 = op_B * P;
+// TrilinosWrappers::MPI::Vector tmp2;
+// B.vmult(tmp2, P);
+// tmp2 *= -1.0;
+// tmp2 += F;
+//
+// // U = op_M_inv * tmp2;
+// solver_M.solve(M, U, tmp2, preconditioner_M);
+//
+// constraints.distribute(solution);
 }
 
 //------------------------------------------------------------------------------
@@ -528,9 +691,13 @@ MixedLaplaceProblem<dim>::solve_umfpack(int&    phi_iteration,
                                         double& j_time)
 {
    timer.start();
-   SparseDirectUMFPACK solver;
-   solver.initialize(system_matrix);
-   solver.vmult(solution, system_rhs);
+   SolverControl   solver_control(1, 0);
+   TrilinosWrappers::SolverDirect direct(solver_control);
+  
+   // direct.solve(system_matrix, solution, system_rhs);
+   // SparseDirectUMFPACK solver;
+   // solver.initialize(system_matrix);
+   // solver.vmult(solution, system_rhs);
    constraints.distribute(solution);
    timer.stop();
 
@@ -558,7 +725,7 @@ MixedLaplaceProblem<dim>::solve_gmres(int&    phi_iteration,
    //SparseILU<double> preconditioner;
    //preconditioner.initialize(system_matrix);
 
-   solver.solve(system_matrix, solution, system_rhs, PreconditionIdentity());
+   // solver.solve(system_matrix, solution, system_rhs, PreconditionIdentity());
 
    phi_iteration = 0;
    j_iteration = 0;
@@ -715,11 +882,12 @@ MixedLaplaceProblem<dim>::run(std::vector<int>&    ncell,
 }
 
 //------------------------------------------------------------------------------
-int
-main()
+int main(int argc, char *argv[])
 {
    try
    {
+      Utilities::MPI::MPI_InitFinalize mpi_initialization(
+        argc, argv, 1);
     std::cout << "Solving " << problem << " problem\n";
 
     ParameterHandler prm;
