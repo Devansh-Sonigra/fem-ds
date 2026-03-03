@@ -14,6 +14,14 @@
 #include <deal.II/base/convergence_table.h>
 #include <deal.II/base/timer.h>
 #include <deal.II/base/parameter_handler.h>
+#include <deal.II/base/mpi.h>
+
+#include <deal.II/lac/petsc_block_vector.h>
+#include <deal.II/lac/petsc_vector_base.h>
+#include <deal.II/lac/solver_control.h>
+#include <deal.II/lac/solver_gmres.h>
+
+#include <deal.II/distributed/tria.h>
 
 #include <deal.II/lac/block_vector.h>
 #include <deal.II/lac/full_matrix.h>
@@ -25,6 +33,16 @@
 #include <deal.II/lac/sparse_ilu.h>
 #include <deal.II/lac/linear_operator.h>
 #include <deal.II/lac/packaged_operation.h>
+
+#include <deal.II/lac/sparsity_tools.h>
+#include <deal.II/lac/petsc_vector.h>
+#include <deal.II/lac/petsc_sparse_matrix.h>
+#include <deal.II/lac/petsc_block_sparse_matrix.h>
+#include <deal.II/lac/petsc_solver.h>
+#include <deal.II/lac/petsc_precondition.h>
+
+//#include <deal.II/lac/petsc_communication_pattern.h>
+//#include <deal.II/lac/exceptions.h>
 
 #include <deal.II/grid/tria.h>
 #include <deal.II/grid/grid_generator.h>
@@ -39,29 +57,23 @@
 #include <deal.II/fe/fe_values.h>
 #include <deal.II/fe/fe_raviart_thomas.h>
 
+#include <deal.II/lac/trilinos_sparse_matrix.h>
 #include <deal.II/numerics/vector_tools.h>
 #include <deal.II/numerics/data_out.h>
 #include <deal.II/numerics/matrix_tools.h>
 #include <deal.II/numerics/data_postprocessor.h>
 
-#include <deal.II/numerics/error_estimator.h>
-#include <deal.II/numerics/solution_transfer.h>
+#define AssertPETSc(code)                          \
+   do                                              \
+   {                                               \
+      PetscErrorCode ierr = (code);                \
+      AssertThrow(ierr == 0, ExcPETScError(ierr)); \
+   } while (false)
 
-#include <deal.II/base/index_set.h>
-#include <deal.II/lac/trilinos_sparse_matrix.h>
-#include <deal.II/lac/trilinos_block_sparse_matrix.h>
-#include <deal.II/lac/trilinos_vector.h>
-#include <deal.II/lac/trilinos_parallel_block_vector.h>
-#include <deal.II/lac/trilinos_precondition.h>
-#include <deal.II/lac/trilinos_precondition.h>
-#include <deal.II/lac/trilinos_solver.h>
-#include <deal.II/lac/linear_operator_tools.h>
-#include <deal.II/base/mpi.h>
- 
-#include <iostream>
-#include <fstream>
-#include <memory>
-#include <limits>
+namespace LA
+{
+   using namespace dealii::PETScWrappers;
+}
 
 #define DIRICHLET 1
 #define NEUMANN   2
@@ -80,6 +92,20 @@ const std::string problem = "Neumann";
 #else
 #error "Unknown PROBLEM"
 #endif
+
+struct BlockVariables
+{
+   LA::MPI::BlockSparseMatrix system_matrix;
+   LA::MPI::BlockVector       system_rhs;
+   LA::MPI::BlockVector       solution;
+};
+
+struct Variables
+{
+   LA::MPI::SparseMatrix system_matrix;
+   LA::MPI::Vector       system_rhs;
+   LA::MPI::Vector       solution;
+};
 
 //------------------------------------------------------------------------------
 template <int dim>
@@ -119,6 +145,77 @@ Postprocessor<dim>::Postprocessor()
    : DataPostprocessor<dim>()
 {}
 
+//------------------------------------------------------------------------------
+class MassMatrixInverse
+{
+public:
+  MassMatrixInverse(const LA::MPI::SparseMatrix &M_in)
+    : M(M_in)
+  {}
+
+  void vmult(LA::MPI::Vector &dst,
+             const LA::MPI::Vector &src) const
+  {
+    ReductionControl reduction_control(2000, 1e-18, 1e-10);
+    LA::SolverCG solver(reduction_control);
+
+    LA::PreconditionJacobi preconditioner;
+    preconditioner.initialize(M);
+
+    solver.solve(M, dst, src, preconditioner);
+  }
+
+private:
+  const LA::MPI::SparseMatrix &M;
+};
+
+//------------------------------------------------------------------------------
+class SchurMatrix
+{
+public:
+  SchurMatrix(const MassMatrixInverse & op_M, const LA::MPI::SparseMatrix &B, const LA::MPI::Vector &U)
+    : op_M(op_M),
+    B(B), 
+    U(U)
+  {}
+
+  void vmult(LA::MPI::Vector &dst,
+             const LA::MPI::Vector &src) const
+  {
+      LA::MPI::Vector tmp_1;
+      tmp_1.reinit(U);
+      LA::MPI::Vector tmp_2;
+      tmp_2.reinit(U);
+      B.vmult(tmp_1, src);
+      op_M.vmult(tmp_2, tmp_1);
+      B.Tvmult(dst, tmp_2);
+  }
+
+private:
+  const MassMatrixInverse & op_M;
+  const LA::MPI::SparseMatrix &B;
+  const LA::MPI::Vector &U;
+};
+//------------------------------------------------------------------------------
+class SchurMatrixInverse
+{
+public:
+  SchurMatrixInverse(SchurMatrix & op_S)
+    : op_S(op_S)
+  {}
+
+  void vmult(LA::MPI::Vector &dst,
+             const LA::MPI::Vector &src) const
+  {
+
+   SolverControl            solver_control_S(6000, 1.e-8);
+   SolverCG<LA::MPI::Vector> solver_S(solver_control_S);
+   solver_S.solve(op_S, dst, src, PreconditionIdentity());
+  }
+
+private:
+  const SchurMatrix & op_S;
+};
 //------------------------------------------------------------------------------
 class ParameterReader : public EnableObserverPointer
 {
@@ -191,6 +288,8 @@ public:
             std::vector<double>& j_time);
 
 private:
+   using PTriangulation = parallel::distributed::Triangulation<dim>;
+
    void make_grid(const unsigned int refine);
    void setup_system();
    void assemble_system();
@@ -224,18 +323,17 @@ private:
 
    Timer               timer;
    double              h_max;
-   Triangulation<dim>  triangulation;
+   PTriangulation      triangulation;
    const FESystem<dim> fe;
    DoFHandler<dim>     dof_handler;
 
-   AffineConstraints<double> constraints;
+   AffineConstraints<double>  constraints;
+   LA::MPI::BlockSparseMatrix system_matrix;
+   LA::MPI::BlockVector       solution;
+   LA::MPI::BlockVector       system_rhs;
 
-   BlockSparsityPattern      sparsity_pattern;
-std::vector<IndexSet>               partitioning;
-   TrilinosWrappers::BlockSparseMatrix system_matrix;
-
-   TrilinosWrappers::MPI::BlockVector solution;
-   TrilinosWrappers::MPI::BlockVector system_rhs;
+   BlockVariables      block_vars;
+   Variables           vars;
 };
 
 //------------------------------------------------------------------------------
@@ -252,6 +350,7 @@ MixedLaplaceProblem<dim>::MixedLaplaceProblem(
    initial_refine(initial_refine),
    perturb(perturb),
    linear_solver(solver),
+   triangulation(MPI_COMM_WORLD),
    fe(FE_RaviartThomas<dim>(degree), FE_DGQ<dim>(degree)),
    dof_handler(triangulation)
 {}
@@ -270,6 +369,7 @@ MixedLaplaceProblem<dim>::make_grid(const unsigned int refine)
              << perturb << std::endl;
 
    // Randomly perturb the grid
+   // TODO: Does this work in parallel
    const auto h = 1.0 / pow(2, refine);
    auto v = triangulation.begin_vertex();
    for(; v < triangulation.end_vertex(); ++v)
@@ -297,11 +397,8 @@ MixedLaplaceProblem<dim>::setup_system()
 
    const std::vector<types::global_dof_index> dofs_per_component =
       DoFTools::count_dofs_per_fe_component(dof_handler);
-   const types::global_dof_index  n_c = dofs_per_component[0],
+   const unsigned int n_c = dofs_per_component[0],
                       n_p = dofs_per_component[dim];
-    partitioning.resize(2);
-    partitioning[0] = complete_index_set(n_c);
-    partitioning[1] = complete_index_set(n_p);
 
    std::cout << "Number of active cells: " << triangulation.n_active_cells()
              << std::endl
@@ -310,14 +407,20 @@ MixedLaplaceProblem<dim>::setup_system()
              << "Number of degrees of freedom: " << dof_handler.n_dofs()
              << " (" << n_c << '+' << n_p << ')' << std::endl;
 
-   constraints.clear();
+   const auto& locally_owned_dofs = dof_handler.locally_owned_dofs();
+   IndexSet locally_relevant_dofs =
+       DoFTools::extract_locally_relevant_dofs(dof_handler);
 
-   #if PROBLEM == DIRICHLET
+   constraints.clear();
+   constraints.reinit(locally_owned_dofs, locally_relevant_dofs);
+
+#if PROBLEM == DIRICHLET
    // p = 0 on all boundary
    // Nothing to do, weakly imposed, just dont add any boundary integral.
-   #else // Neumann problem
+#else // Neumann problem: TODO
    // J.n = 0 on all boundaries
-   VectorTools::project_boundary_values_div_conforming(dof_handler,
+   VectorTools::project_boundary_values_div_conforming
+        (dof_handler,
          0,
          Functions::ZeroFunction<dim>(dim),
          types::boundary_id(0),
@@ -382,7 +485,7 @@ MixedLaplaceProblem<dim>::setup_system()
       if(i != first_dof && bool_boundary_dofs[i])
          rhs.emplace_back(i, -integral_vector(i) / integral_vector(first_dof));
    constraints.add_constraint(first_dof, rhs);
-   #endif
+#endif
 
    constraints.close();
 
@@ -391,16 +494,59 @@ MixedLaplaceProblem<dim>::setup_system()
    coupling.fill(DoFTools::always);
    coupling(dim, dim) = DoFTools::none;
 
-   const std::vector<types::global_dof_index> block_sizes = {n_c, n_p};
-   BlockDynamicSparsityPattern                dsp(block_sizes, block_sizes);
-   DoFTools::make_sparsity_pattern(dof_handler, coupling, dsp, constraints, false);
-   // sparsity_pattern.copy_from(dsp);
+   std::vector<IndexSet>
+       owned_partitioning = {locally_owned_dofs.get_view(0, n_c),
+                             locally_owned_dofs.get_view(n_c, n_c + n_p)};
+   std::vector<IndexSet>
+      relevant_partitioning = {locally_relevant_dofs.get_view(0, n_c),
+                               locally_relevant_dofs.get_view(n_c, n_c + n_p)};
 
-   std::cout << "hell" << std::endl;
-   system_matrix.reinit(dsp);
-   std::cout << "hell" << std::endl;
-   solution.reinit(partitioning, MPI_COMM_WORLD);
-   system_rhs.reinit(partitioning, MPI_COMM_WORLD);
+   BlockDynamicSparsityPattern sparsity_pattern(relevant_partitioning);
+
+   DoFTools::make_sparsity_pattern(dof_handler,
+                                   coupling,
+                                   sparsity_pattern,
+                                   constraints,
+                                   false);
+   SparsityTools::distribute_sparsity_pattern(sparsity_pattern,
+                                              locally_owned_dofs,
+                                              MPI_COMM_WORLD,
+                                              locally_relevant_dofs);
+
+   DynamicSparsityPattern sparsity_pattern_1(locally_relevant_dofs);
+   DoFTools::make_sparsity_pattern(dof_handler,
+                                   coupling,
+                                   sparsity_pattern_1,
+                                   constraints,
+                                   false);
+   SparsityTools::distribute_sparsity_pattern(sparsity_pattern_1,
+                                              locally_owned_dofs,
+                                              MPI_COMM_WORLD,
+                                              locally_relevant_dofs);
+   // // sparsity_pattern_1.copy_from(sparsity_pattern);
+   //
+   // for(unsigned int i = 0; i < dof_handler.n_dofs(); ++i)
+   // {
+   //     for(unsigned int j = 0; j < dof_handler.n_dofs(); ++j)
+   //     {
+   //         if(sparsity_pattern.exists(i,j))
+   //         sparsity_pattern_1.add(i, j);
+   //     }
+   // }
+
+   if(linear_solver == "schur")
+   {
+       block_vars.system_matrix.reinit(owned_partitioning,
+                            sparsity_pattern,
+                            MPI_COMM_WORLD);
+       block_vars.solution.reinit(owned_partitioning, MPI_COMM_WORLD);
+       block_vars.system_rhs.reinit(owned_partitioning, MPI_COMM_WORLD);;
+    } else {
+       vars.system_matrix.reinit(locally_owned_dofs, locally_owned_dofs, sparsity_pattern_1,
+                            MPI_COMM_WORLD);
+       vars.solution.reinit(locally_owned_dofs, MPI_COMM_WORLD);
+       vars.system_rhs.reinit(locally_owned_dofs, MPI_COMM_WORLD);;
+    }
 
    timer.stop();
    // double time_elapsed = timer.last_wall_time();
@@ -431,6 +577,7 @@ MixedLaplaceProblem<dim>::assemble_system()
    h_max = 0.0;
    double aspect = 1.0;
    for(const auto& cell : dof_handler.active_cell_iterators())
+   if(cell->is_locally_owned())
    {
       h_max = std::max(h_max, cell->diameter());
       const double dx = cell->face(2)->measure();
@@ -473,15 +620,37 @@ MixedLaplaceProblem<dim>::assemble_system()
       }
 
       cell->get_dof_indices(local_dof_indices);
+      if(linear_solver == "schur")
+      {
       constraints.distribute_local_to_global(local_matrix,
                                              local_rhs,
                                              local_dof_indices,
-                                             system_matrix,
-                                             system_rhs);
+                                             block_vars.system_matrix,
+                                             block_vars.system_rhs);
+      }
+      else
+      {
+      constraints.distribute_local_to_global(local_matrix,
+                                             local_rhs,
+                                             local_dof_indices,
+                                             vars.system_matrix,
+                                             vars.system_rhs);
+      }
    }
-   std::cout << "Largest cell aspect ratio = " << aspect << std::endl;
+   if(linear_solver == "schur")
+   {
+       block_vars.system_matrix.compress(VectorOperation::add);
+       block_vars.system_rhs.compress(VectorOperation::add);
+   }
+   else{
+   vars.system_matrix.compress(VectorOperation::add);
+   vars.system_rhs.compress(VectorOperation::add);
+   }
    timer.stop();
    double time_elapsed = timer.last_wall_time();
+
+   // TODO reduce h_max, aspect over all ranks
+   std::cout << "Largest cell aspect ratio = " << aspect << std::endl;
    std::cout << "Time for assembly = " << time_elapsed << " sec\n";
 }
 
@@ -493,193 +662,80 @@ MixedLaplaceProblem<dim>::solve_schur(int&    phi_iteration,
                                       double& phi_time,
                                       double& j_time)
 {
-   const auto& M = system_matrix.block(0, 0);
-   const auto& B = system_matrix.block(0, 1);
+   
+   const auto& M = block_vars.system_matrix.block(0, 0);
+   const auto& B = block_vars.system_matrix.block(0, 1);
 
-   const auto& F = system_rhs.block(0);
-   const auto& G = system_rhs.block(1);
+   const auto& F = block_vars.system_rhs.block(0);
+   const auto& G = block_vars.system_rhs.block(1);
 
-   auto& U = solution.block(0);
-   auto& P = solution.block(1);
-   std::cout << "hello world" << std::endl;
+   auto& U = block_vars.solution.block(0);
+   auto& P = block_vars.solution.block(1);
 
-   const auto op_M = linear_operator<TrilinosWrappers::MPI::Vector, TrilinosWrappers::MPI::Vector, TrilinosWrappers::internal::LinearOperatorImplementation::TrilinosPayload, TrilinosWrappers::SparseMatrix>(M);
-   const auto op_B = linear_operator<TrilinosWrappers::MPI::Vector, TrilinosWrappers::MPI::Vector, TrilinosWrappers::internal::LinearOperatorImplementation::TrilinosPayload, TrilinosWrappers::SparseMatrix>(B);
+   // TrilinosWrappers::SparseMatrix M_1;
+
+   // const auto op_M = TrilinosWrappers::linear_operator(M_1); \\ why is this not working??
+   const auto op_M = linear_operator<LA::MPI::Vector>(M);
+   const auto op_B = linear_operator<LA::MPI::Vector>(B);
 
    ReductionControl         reduction_control_M(2000, 1.0e-18, 1.0e-10);
-   TrilinosWrappers::SolverGMRES solver_M(reduction_control_M);
-   TrilinosWrappers::PreconditionJacobi preconditioner_M;
+   LA::SolverCG solver_M(reduction_control_M);
+   LA::PreconditionJacobi preconditioner_M;
 
    preconditioner_M.initialize(M);
 
-   const auto op_M_inv = inverse_operator< TrilinosWrappers::internal::LinearOperatorImplementation::TrilinosPayload,TrilinosWrappers::SolverGMRES, TrilinosWrappers::MPI::Vector, TrilinosWrappers::MPI::Vector>(op_M, solver_M, preconditioner_M);
-    // const auto op_M_inv = inverse_operator(op_M, solver_M, preconditioner_M);
+   MassMatrixInverse op_M_inv(M);
+   // const auto op_M_inv = inverse_operator(op_M, solver_M, preconditioner_M);
 
-   const auto op_S = transpose_operator(op_B) * op_M_inv * op_B;
-    // // 1. Explicitly wrap the preconditioner using M as the exemplar
-    // const auto op_precond_M = linear_operator<
-    //     TrilinosWrappers::MPI::Vector, 
-    //     TrilinosWrappers::MPI::Vector, 
-    //     TrilinosWrappers::internal::LinearOperatorImplementation::TrilinosPayload
-    // >(M, preconditioner_M);
-    //
-    // // 2. Now use the properly typed operator in your Schur complement definition
-    // const auto op_aS = transpose_operator(op_B) * op_precond_M * op_B;
-   const auto op_aS =
-      transpose_operator(op_B) * linear_operator<TrilinosWrappers::MPI::Vector, TrilinosWrappers::MPI::Vector, TrilinosWrappers::internal::LinearOperatorImplementation::TrilinosPayload>(preconditioner_M) * op_B;
-
-   IterationNumberControl   iteration_number_control_aS(30, 1.e-18);
-   TrilinosWrappers::SolverGMRES solver_aS(iteration_number_control_aS);
-
-    // // Wrap identity preconditioner with proper Trilinos payload
-    // const auto op_identity = linear_operator<
-    //     TrilinosWrappers::MPI::Vector,
-    //     TrilinosWrappers::MPI::Vector,
-    //     TrilinosWrappers::internal::LinearOperatorImplementation::TrilinosPayload
-    // >(op_aS); // use op_aS as exemplar, gives identity-like operator
-    //
-    // const auto preconditioner_S =
-    //     inverse_operator<
-    //         TrilinosWrappers::internal::LinearOperatorImplementation::TrilinosPayload,
-    //         TrilinosWrappers::SolverGMRES,
-    //         TrilinosWrappers::MPI::Vector,
-    //         TrilinosWrappers::MPI::Vector
-    //     >(op_aS, solver_aS, op_identity);
-   const auto preconditioner_S =
-      inverse_operator< TrilinosWrappers::internal::LinearOperatorImplementation::TrilinosPayload,TrilinosWrappers::SolverGMRES, TrilinosWrappers::MPI::Vector, TrilinosWrappers::MPI::Vector>(op_aS, solver_aS);
-
-   std::cout << "hello world 3" << std::endl;
+   // const auto op_S = transpose_operator(op_B) * op_M_inv * op_B;
+   SchurMatrix op_S(op_M_inv, B, U);
+   // const auto op_aS =
+   //    transpose_operator(op_B) * linear_operator<LA::MPI::Vector>(preconditioner_M) * op_B;
+   //
+   // IterationNumberControl   iteration_number_control_aS(30, 1.e-18);
+   // SolverCG<Vector<double>> solver_aS(iteration_number_control_aS);
+   //
+   // const auto preconditioner_S =
+   //    inverse_operator(op_aS, solver_aS, PreconditionIdentity());
+   //
    // const auto schur_rhs = transpose_operator(op_B) * op_M_inv * F - G;
-    // 1. Create a concrete vector with the exact same memory layout/size as G or P
-    TrilinosWrappers::MPI::Vector schur_rhs(G); 
-
-    // 2. Perform the assignment. This forces the expression to evaluate 
-    // immediately while all temporaries are still alive.
-    schur_rhs = transpose_operator(op_B) * op_M_inv * F - G;
-   // const TrilinosWrappers::MPI::Vector schur_rhs = transpose_operator(op_B) * op_M_inv * F - G;
-   std::cout << "hello world 4" << std::endl;
-   // const auto schur_rhs = transpose_operator(op_B) * op_M_inv * F;
-   // TrilinosWrappers::MPI::Vector temp1;
-
-   SolverControl            solver_control_S(6000, 1.e-8);
-   TrilinosWrappers::SolverGMRES solver_S(solver_control_S);
-
-   // const auto op_S_inv = inverse_operator< TrilinosWrappers::internal::LinearOperatorImplementation::TrilinosPayload,TrilinosWrappers::SolverGMRES, TrilinosWrappers::MPI::Vector, TrilinosWrappers::MPI::Vector>(op_S, solver_S, preconditioner_S);
-   const auto op_S_inv = inverse_operator< TrilinosWrappers::internal::LinearOperatorImplementation::TrilinosPayload,TrilinosWrappers::SolverGMRES, TrilinosWrappers::MPI::Vector, TrilinosWrappers::MPI::Vector>(op_S, solver_S, preconditioner_S);
-
+   LA::MPI::Vector tmp;
+   tmp.reinit(F);
+   op_M_inv.vmult(tmp, F);
+   LA::MPI::Vector schur_rhs;
+   schur_rhs.reinit(G);
+   B.Tvmult(schur_rhs, tmp);
+   schur_rhs -= G;
+   //
+   // SolverControl            solver_control_S(6000, 1.e-8);
+   // SolverCG<Vector<double>> solver_S(solver_control_S);
+   //
+   // const auto op_S_inv = inverse_operator(op_S, solver_S, preconditioner_S);
+   //
    timer.start();
-   std::cout << "hello world 1" << std::endl;
-   std::cout << schur_rhs(0) << std::endl;
-   P = op_S_inv * schur_rhs;
-   std::cout << "hello world 2" << std::endl;
+   // P = op_S_inv * schur_rhs;
+   SchurMatrixInverse op_S_inv(op_S);
+   op_S_inv.vmult(P, schur_rhs);
    timer.stop();
+   // op_M_inv.vmult(P, P);
    phi_time = timer.last_wall_time();
-   phi_iteration = solver_control_S.last_step();
-   std::cout << phi_iteration<< std::endl;
+   // phi_iteration = solver_control_S.last_step();
+   phi_iteration = 0;
 
    timer.start();
-   U = op_M_inv * (F - op_B * P);
-   constraints.distribute(solution);
+   // U = op_M_inv * (F - op_B * P);
+   LA::MPI::Vector tmp_1;
+   tmp_1.reinit(U);
+   B.vmult(tmp_1, P);
+   tmp_1 -= F;
+   tmp_1 *= -1;
+   op_M_inv.vmult(U,tmp_1);
+   constraints.distribute(block_vars.solution);
    timer.stop();
-   j_iteration = reduction_control_M.last_step();
+   // j_iteration = reduction_control_M.last_step();
+   j_iteration = 0;
    j_time = timer.last_wall_time();
-
-// const auto &M = system_matrix.block(0, 0);
-// const auto &B = system_matrix.block(0, 1);
-// auto &B_transpose = system_matrix.block(0, 1);
-// B_transpose.transpose();
-//
-// const auto &F = system_rhs.block(0);
-// const auto &G = system_rhs.block(1);
-//
-// auto &U = solution.block(0);
-// auto &P = solution.block(1);
-//
-// using Vec = TrilinosWrappers::MPI::Vector;
-//
-// const auto op_M = linear_operator<Vec, Vec>(M);
-// const auto op_B = linear_operator<Vec, Vec>(B);
-//
-// ReductionControl reduction_control_M(2000, 1.0e-18, 1.0e-10);
-//
-// TrilinosWrappers::SolverCG solver_M(reduction_control_M);
-// TrilinosWrappers::PreconditionJacobi preconditioner_M;
-//
-// preconditioner_M.initialize(M);
-//
-// // const auto op_M_inv =
-// //     inverse_operator(op_M, solver_M, preconditioner_M);
-// // const auto op_M_inv = linear_operator<Vec, Vec>(
-// //   [&](Vec &dst, const Vec &src) {
-// //     solver_M.solve(M, dst, src, preconditioner_M);
-// //   });
-// auto op_M_inv = linear_operator<Vec, Vec>(M);
-// op_M_inv.vmult = [&](Vec &dst, const Vec &src) {
-//     solver_M.solve(M, dst, src, preconditioner_M);
-//   };
-//
-// // Schur operator
-// const LinearOperator<Vec, Vec> op_S =
-//     transpose_operator(op_B) * op_M_inv * op_B;
-//
-// // Approximate Schur (for preconditioning)
-// const LinearOperator<Vec, Vec> op_aS =
-//     transpose_operator(op_B)
-//     * linear_operator<Vec, Vec>(preconditioner_M)
-//     * op_B;
-//
-// IterationNumberControl iteration_number_control_aS(30, 1.e-18);
-// TrilinosWrappers::SolverCG solver_aS(iteration_number_control_aS);
-//
-// const auto preconditioner_S =
-//     inverse_operator(op_aS,
-//                      solver_aS,
-//                      PreconditionIdentity());
-//
-// // Schur RHS
-// // auto tmp = op_M_inv * F;
-// TrilinosWrappers::MPI::Vector tmp;
-// tmp.reinit(solution);
-// solver_M.solve(M, tmp, F, preconditioner_M);
-//
-// // auto schur_rhs = transpose_operator(op_B) * tmp;
-// TrilinosWrappers::MPI::Vector schur_rhs;
-// schur_rhs.reinit(tmp);
-// // schur_rhs = B_transpose * tmp; 
-// B_transpose.vmult(schur_rhs, tmp);
-// schur_rhs -= G;
-//
-// SolverControl solver_control_S(6000, 1.e-8);
-// TrilinosWrappers::SolverGMRES solver_S(solver_control_S);
-//
-// // const auto op_S_inv =
-// //     inverse_operator(op_S, solver_S, preconditioner_S);
-// auto op_S_inv = linear_operator<Vec,Vec>(op_S);
-// op_S_inv.vmult = [&](Vec &dst, const Vec &src) {
-//     solver_S.solve(op_S, dst, src, preconditioner_S);
-// };
-//
-// // Solve Schur
-// // P = op_S_inv * schur_rhs;
-// // This effectively calls GMRES internally using the settings from op_S_inv
-// op_S_inv.vmult(P, schur_rhs);
-// // solver_S.solve(op_S, P, schur_rhs, preconditioner_S);
-// // TrilinosWrapper::MPI::Vector tmp_rhs;
-// // tmp_rhs.reinit(schur_rhs);
-// // tmp_rhs = B * schur_rhs;
-// // solver_M.solve(, P, schur_rhs, preconditioner_S);
-//
-// // Recover U
-// // auto tmp2 = op_B * P;
-// TrilinosWrappers::MPI::Vector tmp2;
-// B.vmult(tmp2, P);
-// tmp2 *= -1.0;
-// tmp2 += F;
-//
-// // U = op_M_inv * tmp2;
-// solver_M.solve(M, U, tmp2, preconditioner_M);
-//
-// constraints.distribute(solution);
+   
 }
 
 //------------------------------------------------------------------------------
@@ -691,14 +747,12 @@ MixedLaplaceProblem<dim>::solve_umfpack(int&    phi_iteration,
                                         double& j_time)
 {
    timer.start();
-   SolverControl   solver_control(1, 0);
-   TrilinosWrappers::SolverDirect direct(solver_control);
-  
-   // direct.solve(system_matrix, solution, system_rhs);
-   // SparseDirectUMFPACK solver;
-   // solver.initialize(system_matrix);
-   // solver.vmult(solution, system_rhs);
-   constraints.distribute(solution);
+   SolverControl cn;
+   LA::SparseDirectMUMPS solver(cn);
+   // solver.initialize(vars.system_matrix);
+   solver.solve(vars.system_matrix, vars.solution, vars.system_rhs);
+   constraints.distribute(vars.solution);
+   // */
    timer.stop();
 
    phi_iteration = 0;
@@ -715,19 +769,69 @@ MixedLaplaceProblem<dim>::solve_gmres(int&    phi_iteration,
                                       double& phi_time,
                                       double& j_time)
 {
+   // timer.start();
+   // /*SolverControl solver_control(1000, 1e-6 * system_rhs.l2_norm());
+   // LA::SolverGMRES::AdditionalData additional_data(false, 30);
+   // LA::SolverGMRES solver(solver_control, additional_data);
+   //
+   // // TODO: Not able to use ILU with BlockMatrix/Vector
+   // SparseILU<double> preconditioner;
+   // preconditioner.initialize(system_matrix);
+   //
+   // solver.solve(system_matrix, solution, system_rhs, LA::PreconditionNone());*/
+   //
+   // auto A = system_matrix.petsc_matrix();
+   // auto b = system_rhs.petsc_vector();
+   // auto x = solution.petsc_vector();
+   //
+   // KSP ksp;
+   // PC  pc;
+   // AssertPETSc(KSPCreate(MPI_COMM_WORLD, &ksp));
+   // AssertPETSc(KSPSetType(ksp, KSPGMRES));
+   // AssertPETSc(KSPGetPC(ksp, &pc));
+   // AssertPETSc(PCSetType(pc, PCNONE));
+   // AssertPETSc(KSPSetOperators(ksp, A, A));
+   // AssertPETSc(KSPSetTolerances(ksp, 1e-6, PETSC_CURRENT, PETSC_CURRENT, 4000));
+   // AssertPETSc(KSPGMRESSetRestart(ksp, 30));
+   // AssertPETSc(KSPSetFromOptions(ksp));
+   // AssertPETSc(KSPSetUp(ksp));
+   // AssertPETSc(KSPSolve(ksp, b, x));
+   // AssertPETSc(KSPGetIterationNumber(ksp, &phi_iteration));
+   // AssertPETSc(KSPDestroy(&ksp));
+   // timer.stop();
+   //
+   // j_iteration = 0;
+   // phi_time = timer.last_wall_time();
+   // j_time = 0.0;
+
    timer.start();
-   SolverControl solver_control(1000, 1e-6 * system_rhs.l2_norm());
-   SolverGMRES<BlockVector<double>>::AdditionalData additional_data;
-   additional_data.max_basis_size = 100;
-   SolverGMRES<BlockVector<double>> solver(solver_control, additional_data);
+   SolverControl solver_control(3000, 1e-6 * vars.system_rhs.l2_norm());
+   // SolverGMRES<LA::MPI::Vector>::AdditionalData additional_data;
+   // additional_data.max_basis_size = 100;
+   // SolverGMRES<LA::MPI::Vector> solver(solver_control, additional_data);
+   // LA::SolverGMRES::AdditionalData additional_data;
+   // additional_data.max_basis_size = 100;
+   LA::SolverGMRES solver(solver_control);
 
    // TODO: Not able to use ILU with BlockMatrix/Vector
-   //SparseILU<double> preconditioner;
+   // SparseILU<LA::MPI::SparseMatrix> preconditioner;
    //preconditioner.initialize(system_matrix);
+   // LA::PreconditionILU preconditioner;               //    not working cause matrix has diagonal entries as 0
+   // LA::PreconditionLU preconditioner;                //    not working cause matrix has diagonal entries as 0
+   LA::PreconditionJacobi preconditioner;            //    working
+   // LA::PreconditionBoomerAMG preconditioner;         //    no convergence
+   // LA::PreconditionICC preconditioner;               //    not working cause matrix has diagonal entries as 0
+   // LA::PreconditionParaSails preconditioner;         //    not working cause matrix not SPD
+   // LA::PreconditionSSOR preconditioner;              //    no convergence is very slow
+   // LA::PreconditionBDDC<dim> preconditioner;
+   // LA::PreconditionBlockJacobi preconditioner;       //    not working cause matrix has diagonal entries as 0 
+   // LA::PreconditionSOR preconditioner;               //    no convergence is very slow
+   preconditioner.initialize(vars.system_matrix);
 
-   // solver.solve(system_matrix, solution, system_rhs, PreconditionIdentity());
+   solver.solve(vars.system_matrix, vars.solution, vars.system_rhs, preconditioner);
+   // solver.solve(vars.system_matrix, vars.solution, vars.system_rhs, preconditioner);
 
-   phi_iteration = 0;
+   phi_iteration = solver_control.last_step();
    j_iteration = 0;
    phi_time = timer.last_wall_time();
    j_time = 0.0;
@@ -762,55 +866,106 @@ MixedLaplaceProblem<dim>::compute_errors(double& phi_err,
    PrescribedSolution::ExactSolution<dim> exact_solution;
    const QGauss<dim> quadrature(degree + 2);
 
+   if(linear_solver == "schur")
    {
-      const ComponentSelectFunction<dim> scalar_mask(dim, dim + 1);
-      Vector<double> cellwise_errors(triangulation.n_active_cells());
-      VectorTools::integrate_difference(dof_handler,
-                                        solution,
-                                        exact_solution,
-                                        cellwise_errors,
-                                        quadrature,
-                                        VectorTools::L2_norm,
-                                        &scalar_mask);
-      phi_err = VectorTools::compute_global_error(triangulation,
-                                                  cellwise_errors,
-                                                  VectorTools::L2_norm);
-   }
+       {
+          const ComponentSelectFunction<dim> scalar_mask(dim, dim + 1);
+          Vector<double> cellwise_errors(triangulation.n_active_cells());
+          VectorTools::integrate_difference(dof_handler,
+                                            block_vars.solution,
+                                            exact_solution,
+                                            cellwise_errors,
+                                            quadrature,
+                                            VectorTools::L2_norm,
+                                            &scalar_mask);
+          phi_err = VectorTools::compute_global_error(triangulation,
+                                                      cellwise_errors,
+                                                      VectorTools::L2_norm);
+       }
 
-   {
-      const ComponentSelectFunction<dim> vector_mask(std::make_pair(0, dim),
-                                                     dim + 1);
-      Vector<double> cellwise_errors(triangulation.n_active_cells());
-      VectorTools::integrate_difference(dof_handler,
-                                        solution,
-                                        exact_solution,
-                                        cellwise_errors,
-                                        quadrature,
-                                        VectorTools::L2_norm,
-                                        &vector_mask);
-      j_err = VectorTools::compute_global_error(triangulation,
-                                                cellwise_errors,
-                                                VectorTools::L2_norm);
-   }
+       {
+          const ComponentSelectFunction<dim> vector_mask(std::make_pair(0, dim),
+                                                         dim + 1);
+          Vector<double> cellwise_errors(triangulation.n_active_cells());
+          VectorTools::integrate_difference(dof_handler,
+                                            block_vars.solution,
+                                            exact_solution,
+                                            cellwise_errors,
+                                            quadrature,
+                                            VectorTools::L2_norm,
+                                            &vector_mask);
+          j_err = VectorTools::compute_global_error(triangulation,
+                                                    cellwise_errors,
+                                                    VectorTools::L2_norm);
+       }
 
-   {
-      const ComponentSelectFunction<dim> vector_mask(std::make_pair(0, dim),
-                                                     dim + 1);
-      Vector<double> cellwise_errors(triangulation.n_active_cells());
-      VectorTools::integrate_difference(dof_handler,
-                                        solution,
-                                        exact_solution,
-                                        cellwise_errors,
-                                        quadrature,
-                                        VectorTools::Hdiv_seminorm,
-                                        &vector_mask);
-      d_err = VectorTools::compute_global_error(triangulation,
-                                                cellwise_errors,
-                                                VectorTools::L2_norm);
+       {
+          const ComponentSelectFunction<dim> vector_mask(std::make_pair(0, dim),
+                                                         dim + 1);
+          Vector<double> cellwise_errors(triangulation.n_active_cells());
+          VectorTools::integrate_difference(dof_handler,
+                                            block_vars.solution,
+                                            exact_solution,
+                                            cellwise_errors,
+                                            quadrature,
+                                            VectorTools::Hdiv_seminorm,
+                                            &vector_mask);
+          d_err = VectorTools::compute_global_error(triangulation,
+                                                    cellwise_errors,
+                                                    VectorTools::L2_norm);
+       }
+   } else{
+       {
+          const ComponentSelectFunction<dim> scalar_mask(dim, dim + 1);
+          Vector<double> cellwise_errors(triangulation.n_active_cells());
+          VectorTools::integrate_difference(dof_handler,
+                                            vars.solution,
+                                            exact_solution,
+                                            cellwise_errors,
+                                            quadrature,
+                                            VectorTools::L2_norm,
+                                            &scalar_mask);
+          phi_err = VectorTools::compute_global_error(triangulation,
+                                                      cellwise_errors,
+                                                      VectorTools::L2_norm);
+       }
+
+       {
+          const ComponentSelectFunction<dim> vector_mask(std::make_pair(0, dim),
+                                                         dim + 1);
+          Vector<double> cellwise_errors(triangulation.n_active_cells());
+          VectorTools::integrate_difference(dof_handler,
+                                            vars.solution,
+                                            exact_solution,
+                                            cellwise_errors,
+                                            quadrature,
+                                            VectorTools::L2_norm,
+                                            &vector_mask);
+          j_err = VectorTools::compute_global_error(triangulation,
+                                                    cellwise_errors,
+                                                    VectorTools::L2_norm);
+       }
+
+       {
+          const ComponentSelectFunction<dim> vector_mask(std::make_pair(0, dim),
+                                                         dim + 1);
+          Vector<double> cellwise_errors(triangulation.n_active_cells());
+          VectorTools::integrate_difference(dof_handler,
+                                            vars.solution,
+                                            exact_solution,
+                                            cellwise_errors,
+                                            quadrature,
+                                            VectorTools::Hdiv_seminorm,
+                                            &vector_mask);
+          d_err = VectorTools::compute_global_error(triangulation,
+                                                    cellwise_errors,
+                                                    VectorTools::L2_norm);
+       }
    }
 }
 
 //------------------------------------------------------------------------------
+// TODO
 template <int dim>
 void
 MixedLaplaceProblem<dim>::output_results(unsigned int n)
@@ -824,13 +979,24 @@ MixedLaplaceProblem<dim>::output_results(unsigned int n)
    interpretation.push_back(DataComponentInterpretation::component_is_scalar);
 
    DataOut<dim> data_out;
-   data_out.add_data_vector(dof_handler,
-                            solution,
-                            solution_names,
-                            interpretation);
+   if(linear_solver == "schur")
+   {
+       data_out.add_data_vector(dof_handler,
+                                block_vars.solution,
+                                solution_names,
+                                interpretation);
 
-   Postprocessor<dim> div_j;
-   data_out.add_data_vector(dof_handler, solution, div_j);
+       Postprocessor<dim> div_j;
+       // data_out.add_data_vector(dof_handler, block_vars.solution, div_j);
+   } else {
+       data_out.add_data_vector(dof_handler,
+                                vars.solution,
+                                solution_names,
+                                interpretation);
+
+       Postprocessor<dim> div_j;
+       // data_out.add_data_vector(dof_handler, vars.solution, div_j);
+   }
 
    data_out.build_patches(degree + 1);
    std::ofstream output("solution_" + Utilities::int_to_string(n) + ".vtu");
@@ -882,12 +1048,12 @@ MixedLaplaceProblem<dim>::run(std::vector<int>&    ncell,
 }
 
 //------------------------------------------------------------------------------
-int main(int argc, char *argv[])
+int
+main(int argc, char **argv)
 {
+   Utilities::MPI::MPI_InitFinalize mpi_initialization(argc, argv, 1);
    try
    {
-      Utilities::MPI::MPI_InitFinalize mpi_initialization(
-        argc, argv, 1);
     std::cout << "Solving " << problem << " problem\n";
 
     ParameterHandler prm;
