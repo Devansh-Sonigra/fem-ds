@@ -296,7 +296,7 @@ private:
    void setup_blockvar_system(const IndexSet &locally_owned_dofs, IndexSet & locally_relevant_dofs, const unsigned int &n_c, const unsigned int &n_p, Table<2, DoFTools::Coupling> &coupling);
    void setup_var_system(const IndexSet &locally_owned_dofs, IndexSet & locally_relevant_dofs, Table<2, DoFTools::Coupling> &coupling);
    void setup_system();
-   void assemble_system();
+   template<typename VariableStruct> void assemble_system(VariableStruct &VarStruct);
    void solve_schur(int&    phi_iteration,
                     int&    j_iteration,
                     double& phi_time,
@@ -313,10 +313,12 @@ private:
               int&    j_iteration,
               double& phi_time,
               double& j_time);
-   void compute_errors(double& phi_err,
+   template<typename VariableStruct>void compute_errors(double& phi_err,
                        double& j_err,
-                       double& d_err);
-   void output_results(unsigned int n);
+                       double& d_err,
+                       VariableStruct &VarStruct);
+   template<typename VariableStruct>void output_results(unsigned int n,
+                                                        VariableStruct &VarStruct);
    void refine_grid(unsigned int refine);
 
    const unsigned int degree;
@@ -570,8 +572,9 @@ MixedLaplaceProblem<dim>::setup_system()
 
 //------------------------------------------------------------------------------
 template <int dim>
+template<typename VariableStruct>
 void
-MixedLaplaceProblem<dim>::assemble_system()
+MixedLaplaceProblem<dim>::assemble_system(VariableStruct &VarStruct)
 {
    timer.start();
    const QGauss<dim> quadrature_formula(degree + 2);
@@ -636,32 +639,32 @@ MixedLaplaceProblem<dim>::assemble_system()
       }
 
       cell->get_dof_indices(local_dof_indices);
-      if(linear_solver == "schur")
-      {
+      // if(linear_solver == "schur")
+      // {
+      // constraints.distribute_local_to_global(local_matrix,
+      //                                        local_rhs,
+      //                                        local_dof_indices,
+      //                                        block_vars.system_matrix,
+      //                                        block_vars.system_rhs);
+      // }
+      // else
+      // {
       constraints.distribute_local_to_global(local_matrix,
                                              local_rhs,
                                              local_dof_indices,
-                                             block_vars.system_matrix,
-                                             block_vars.system_rhs);
-      }
-      else
-      {
-      constraints.distribute_local_to_global(local_matrix,
-                                             local_rhs,
-                                             local_dof_indices,
-                                             vars.system_matrix,
-                                             vars.system_rhs);
-      }
+                                             VarStruct.system_matrix,
+                                             VarStruct.system_rhs);
+      // }
    }
-   if(linear_solver == "schur")
-   {
-       block_vars.system_matrix.compress(VectorOperation::add);
-       block_vars.system_rhs.compress(VectorOperation::add);
-   }
-   else{
-   vars.system_matrix.compress(VectorOperation::add);
-   vars.system_rhs.compress(VectorOperation::add);
-   }
+   // if(linear_solver == "schur")
+   // {
+   //     block_vars.system_matrix.compress(VectorOperation::add);
+   //     block_vars.system_rhs.compress(VectorOperation::add);
+   // }
+   // else{
+   VarStruct.system_matrix.compress(VectorOperation::add);
+   VarStruct.system_rhs.compress(VectorOperation::add);
+   // }
    timer.stop();
    double time_elapsed = timer.last_wall_time();
 
@@ -882,21 +885,21 @@ MixedLaplaceProblem<dim>::solve(int&    phi_iteration,
 
 //------------------------------------------------------------------------------
 template <int dim>
+template<typename VariableStruct>
 void
 MixedLaplaceProblem<dim>::compute_errors(double& phi_err,
                                          double& j_err,
-                                         double& d_err)
+                                         double& d_err,
+                                         VariableStruct &VarStruct)
 {
    PrescribedSolution::ExactSolution<dim> exact_solution;
    const QGauss<dim> quadrature(degree + 2);
 
-   if(linear_solver == "schur")
-   {
        {
           const ComponentSelectFunction<dim> scalar_mask(dim, dim + 1);
           Vector<double> cellwise_errors(triangulation.n_active_cells());
           VectorTools::integrate_difference(dof_handler,
-                                            block_vars.solution,
+                                            VarStruct.solution,
                                             exact_solution,
                                             cellwise_errors,
                                             quadrature,
@@ -912,7 +915,7 @@ MixedLaplaceProblem<dim>::compute_errors(double& phi_err,
                                                          dim + 1);
           Vector<double> cellwise_errors(triangulation.n_active_cells());
           VectorTools::integrate_difference(dof_handler,
-                                            block_vars.solution,
+                                            VarStruct.solution,
                                             exact_solution,
                                             cellwise_errors,
                                             quadrature,
@@ -928,7 +931,7 @@ MixedLaplaceProblem<dim>::compute_errors(double& phi_err,
                                                          dim + 1);
           Vector<double> cellwise_errors(triangulation.n_active_cells());
           VectorTools::integrate_difference(dof_handler,
-                                            block_vars.solution,
+                                            VarStruct.solution,
                                             exact_solution,
                                             cellwise_errors,
                                             quadrature,
@@ -938,61 +941,14 @@ MixedLaplaceProblem<dim>::compute_errors(double& phi_err,
                                                     cellwise_errors,
                                                     VectorTools::L2_norm);
        }
-   } else{
-       {
-          const ComponentSelectFunction<dim> scalar_mask(dim, dim + 1);
-          Vector<double> cellwise_errors(triangulation.n_active_cells());
-          VectorTools::integrate_difference(dof_handler,
-                                            vars.solution,
-                                            exact_solution,
-                                            cellwise_errors,
-                                            quadrature,
-                                            VectorTools::L2_norm,
-                                            &scalar_mask);
-          phi_err = VectorTools::compute_global_error(triangulation,
-                                                      cellwise_errors,
-                                                      VectorTools::L2_norm);
-       }
-
-       {
-          const ComponentSelectFunction<dim> vector_mask(std::make_pair(0, dim),
-                                                         dim + 1);
-          Vector<double> cellwise_errors(triangulation.n_active_cells());
-          VectorTools::integrate_difference(dof_handler,
-                                            vars.solution,
-                                            exact_solution,
-                                            cellwise_errors,
-                                            quadrature,
-                                            VectorTools::L2_norm,
-                                            &vector_mask);
-          j_err = VectorTools::compute_global_error(triangulation,
-                                                    cellwise_errors,
-                                                    VectorTools::L2_norm);
-       }
-
-       {
-          const ComponentSelectFunction<dim> vector_mask(std::make_pair(0, dim),
-                                                         dim + 1);
-          Vector<double> cellwise_errors(triangulation.n_active_cells());
-          VectorTools::integrate_difference(dof_handler,
-                                            vars.solution,
-                                            exact_solution,
-                                            cellwise_errors,
-                                            quadrature,
-                                            VectorTools::Hdiv_seminorm,
-                                            &vector_mask);
-          d_err = VectorTools::compute_global_error(triangulation,
-                                                    cellwise_errors,
-                                                    VectorTools::L2_norm);
-       }
-   }
 }
 
 //------------------------------------------------------------------------------
 // TODO
 template <int dim>
+template<typename VariableStruct>
 void
-MixedLaplaceProblem<dim>::output_results(unsigned int n)
+MixedLaplaceProblem<dim>::output_results(unsigned int n, VariableStruct &VarStruct)
 {
    timer.start();
    std::vector<std::string> solution_names(dim, "vector");
@@ -1003,25 +959,13 @@ MixedLaplaceProblem<dim>::output_results(unsigned int n)
    interpretation.push_back(DataComponentInterpretation::component_is_scalar);
 
    DataOut<dim> data_out;
-   if(linear_solver == "schur")
-   {
        data_out.add_data_vector(dof_handler,
-                                block_vars.solution,
+                                VarStruct.solution,
                                 solution_names,
                                 interpretation);
 
        Postprocessor<dim> div_j;
-       // data_out.add_data_vector(dof_handler, block_vars.solution, div_j);
-   } else {
-       data_out.add_data_vector(dof_handler,
-                                vars.solution,
-                                solution_names,
-                                interpretation);
-
-       Postprocessor<dim> div_j;
-       // data_out.add_data_vector(dof_handler, vars.solution, div_j);
-   }
-
+       data_out.add_data_vector(dof_handler, VarStruct.solution, div_j);
    data_out.build_patches(degree + 1);
    std::ofstream output("solution_" + Utilities::int_to_string(n) + ".vtu");
    data_out.write_vtu(output);
@@ -1054,11 +998,24 @@ MixedLaplaceProblem<dim>::run(std::vector<int>&    ncell,
       setup_system();
 
       // Solve J,phi
-      assemble_system();
+      if(linear_solver == "schur")
+      {
+         assemble_system<BlockVariables>(block_vars);
+      } else {
+         assemble_system<Variables>(vars);
+      }
+
       solve(phi_iterations[i], j_iterations[i], phi_time[i], j_time[i]);
 
-      compute_errors(phi_error[i], j_error[i], d_error[i]);
-      output_results(i);
+      if(linear_solver == "schur")
+      {
+          compute_errors<BlockVariables>(phi_error[i], j_error[i], d_error[i], block_vars);
+          output_results<BlockVariables>(i, block_vars);
+      } else {
+          compute_errors<Variables>(phi_error[i], j_error[i], d_error[i], vars);
+          output_results<Variables>(i, vars);
+      }
+
 
       ncell[i] = triangulation.n_active_cells();
       const std::vector<types::global_dof_index> dofs_per_component =
