@@ -256,7 +256,7 @@ ParameterReader::declare_parameters()
                     "Perturb grid");
   prm.declare_entry("solver",
                     "schur",
-                    Patterns::Selection("schur|umfpack|gmres"),
+                    Patterns::Selection("schur|umfpack|petsc_gmres|gmres"),
                     "Linear solver");
 }
 
@@ -305,6 +305,10 @@ private:
                       int&    j_iteration,
                       double& phi_time,
                       double& j_time);
+   void solve_petsc_gmres(int&    phi_iteration,
+                    int&    j_iteration,
+                    double& phi_time,
+                    double& j_time);
    void solve_gmres(int&    phi_iteration,
                     int&    j_iteration,
                     double& phi_time,
@@ -783,7 +787,7 @@ MixedLaplaceProblem<dim>::solve_umfpack(int&    phi_iteration,
 //------------------------------------------------------------------------------
 template <int dim>
 void
-MixedLaplaceProblem<dim>::solve_gmres(int&    phi_iteration,
+MixedLaplaceProblem<dim>::solve_petsc_gmres(int&    phi_iteration,
                                       int&    j_iteration,
                                       double& phi_time,
                                       double& j_time)
@@ -829,39 +833,42 @@ MixedLaplaceProblem<dim>::solve_gmres(int&    phi_iteration,
    phi_time = timer.last_wall_time();
    j_time = 0.0;
 
-
+}
 //------------------------------------------------------------------------------
-   // timer.start();
-   // SolverControl solver_control(3000, 1e-6 * vars.system_rhs.l2_norm());
-   // // SolverGMRES<LA::MPI::Vector>::AdditionalData additional_data;
-   // // additional_data.max_basis_size = 100;
-   // // SolverGMRES<LA::MPI::Vector> solver(solver_control, additional_data);
-   // // LA::SolverGMRES::AdditionalData additional_data;
-   // // additional_data.max_basis_size = 100;
-   // LA::SolverGMRES solver(solver_control);
-   //
-   // // TODO: Not able to use ILU with BlockMatrix/Vector
-   // // SparseILU<LA::MPI::SparseMatrix> preconditioner;
-   // //preconditioner.initialize(system_matrix);
+template <int dim>
+void
+MixedLaplaceProblem<dim>::solve_gmres(int&    phi_iteration,
+                    int&    j_iteration,
+                    double& phi_time,
+                    double& j_time)
+{
+   timer.start();
+   SolverControl solver_control(3000, 1e-6 * vars.system_rhs.l2_norm());
+   LA::SolverGMRES solver(solver_control);
+
+   // TODO: Not able to use ILU with BlockMatrix/Vector
+   // SparseILU<LA::MPI::SparseMatrix> preconditioner;
+   //preconditioner.initialize(system_matrix);
    // LA::PreconditionILU preconditioner;               //    not working cause matrix has diagonal entries as 0
-   // // LA::PreconditionLU preconditioner;                //    not working cause matrix has diagonal entries as 0
-   // // LA::PreconditionJacobi preconditioner;            //    working
-   // // LA::PreconditionBoomerAMG preconditioner;         //    no convergence
-   // // LA::PreconditionICC preconditioner;               //    not working cause matrix has diagonal entries as 0
-   // // LA::PreconditionParaSails preconditioner;         //    not working cause matrix not SPD
-   // // LA::PreconditionSSOR preconditioner;              //    no convergence is very slow
-   // // LA::PreconditionBDDC<dim> preconditioner;
-   // // LA::PreconditionBlockJacobi preconditioner;       //    not working cause matrix has diagonal entries as 0 
-   // // LA::PreconditionSOR preconditioner;               //    no convergence is very slow
-   // preconditioner.initialize(vars.system_matrix);
-   //
+   // LA::PreconditionLU preconditioner;                //    not working cause matrix has diagonal entries as 0
+   LA::PreconditionJacobi preconditioner;            //    working
+   // LA::PreconditionBoomerAMG preconditioner;         //    no convergence
+   // LA::PreconditionICC preconditioner;               //    not working cause matrix has diagonal entries as 0
+   // LA::PreconditionParaSails preconditioner;         //    not working cause matrix not SPD
+   // LA::PreconditionSSOR preconditioner;              //    no convergence is very slow
+   // LA::PreconditionBDDC<dim> preconditioner;
+   // LA::PreconditionBlockJacobi preconditioner;       //    not working cause matrix has diagonal entries as 0 
+   // LA::PreconditionSOR preconditioner;               //    no convergence is very slow
+   // LA::PreconditionNone preconditioner;
+   preconditioner.initialize(vars.system_matrix);
+
    // solver.solve(vars.system_matrix, vars.solution, vars.system_rhs, preconditioner);
-   // // solver.solve(vars.system_matrix, vars.solution, vars.system_rhs, preconditioner);
-   //
-   // phi_iteration = solver_control.last_step();
-   // j_iteration = 0;
-   // phi_time = timer.last_wall_time();
-   // j_time = 0.0;
+   solver.solve(vars.system_matrix, vars.solution, vars.system_rhs, preconditioner);
+
+   phi_iteration = solver_control.last_step();
+   j_iteration = 0;
+   phi_time = timer.last_wall_time();
+   j_time = 0.0;
 }
 
 //------------------------------------------------------------------------------
@@ -876,6 +883,8 @@ MixedLaplaceProblem<dim>::solve(int&    phi_iteration,
       solve_schur(phi_iteration, j_iteration, phi_time, j_time);
    else if(linear_solver == "umfpack")
       solve_umfpack(phi_iteration, j_iteration, phi_time, j_time);
+   else if(linear_solver == "petsc_gmres")
+       solve_petsc_gmres(phi_iteration, j_iteration, phi_time, j_time);
    else
       solve_gmres(phi_iteration, j_iteration, phi_time, j_time);
 

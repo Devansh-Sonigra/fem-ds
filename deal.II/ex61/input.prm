@@ -2,4 +2,4 @@ set degree = 1
 set nrefine = 4
 set initial_refine = 5
 set perturb grid = 0.0
-set solver = schur       # schur, umfpack, gmres
+set solver = gmres       # schur, umfpack, petsc_gmres, gmres
