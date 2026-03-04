@@ -62,6 +62,8 @@
 #include <deal.II/numerics/data_out.h>
 #include <deal.II/numerics/matrix_tools.h>
 #include <deal.II/numerics/data_postprocessor.h>
+#include <petscpctypes.h>
+#include <petscpc.h>
 
 #define AssertPETSc(code)                          \
    do                                              \
@@ -769,72 +771,82 @@ MixedLaplaceProblem<dim>::solve_gmres(int&    phi_iteration,
                                       double& phi_time,
                                       double& j_time)
 {
-   // timer.start();
-   // /*SolverControl solver_control(1000, 1e-6 * system_rhs.l2_norm());
-   // LA::SolverGMRES::AdditionalData additional_data(false, 30);
-   // LA::SolverGMRES solver(solver_control, additional_data);
-   //
-   // // TODO: Not able to use ILU with BlockMatrix/Vector
-   // SparseILU<double> preconditioner;
-   // preconditioner.initialize(system_matrix);
-   //
-   // solver.solve(system_matrix, solution, system_rhs, LA::PreconditionNone());*/
-   //
-   // auto A = system_matrix.petsc_matrix();
-   // auto b = system_rhs.petsc_vector();
-   // auto x = solution.petsc_vector();
-   //
-   // KSP ksp;
-   // PC  pc;
-   // AssertPETSc(KSPCreate(MPI_COMM_WORLD, &ksp));
-   // AssertPETSc(KSPSetType(ksp, KSPGMRES));
-   // AssertPETSc(KSPGetPC(ksp, &pc));
-   // AssertPETSc(PCSetType(pc, PCNONE));
-   // AssertPETSc(KSPSetOperators(ksp, A, A));
-   // AssertPETSc(KSPSetTolerances(ksp, 1e-6, PETSC_CURRENT, PETSC_CURRENT, 4000));
-   // AssertPETSc(KSPGMRESSetRestart(ksp, 30));
-   // AssertPETSc(KSPSetFromOptions(ksp));
-   // AssertPETSc(KSPSetUp(ksp));
-   // AssertPETSc(KSPSolve(ksp, b, x));
-   // AssertPETSc(KSPGetIterationNumber(ksp, &phi_iteration));
-   // AssertPETSc(KSPDestroy(&ksp));
-   // timer.stop();
-   //
-   // j_iteration = 0;
-   // phi_time = timer.last_wall_time();
-   // j_time = 0.0;
-
    timer.start();
-   SolverControl solver_control(3000, 1e-6 * vars.system_rhs.l2_norm());
-   // SolverGMRES<LA::MPI::Vector>::AdditionalData additional_data;
-   // additional_data.max_basis_size = 100;
-   // SolverGMRES<LA::MPI::Vector> solver(solver_control, additional_data);
-   // LA::SolverGMRES::AdditionalData additional_data;
-   // additional_data.max_basis_size = 100;
-   LA::SolverGMRES solver(solver_control);
+   /*SolverControl solver_control(1000, 1e-6 * system_rhs.l2_norm());
+   LA::SolverGMRES::AdditionalData additional_data(false, 30);
+   LA::SolverGMRES solver(solver_control, additional_data);
 
    // TODO: Not able to use ILU with BlockMatrix/Vector
-   // SparseILU<LA::MPI::SparseMatrix> preconditioner;
-   //preconditioner.initialize(system_matrix);
-   // LA::PreconditionILU preconditioner;               //    not working cause matrix has diagonal entries as 0
-   // LA::PreconditionLU preconditioner;                //    not working cause matrix has diagonal entries as 0
-   LA::PreconditionJacobi preconditioner;            //    working
-   // LA::PreconditionBoomerAMG preconditioner;         //    no convergence
-   // LA::PreconditionICC preconditioner;               //    not working cause matrix has diagonal entries as 0
-   // LA::PreconditionParaSails preconditioner;         //    not working cause matrix not SPD
-   // LA::PreconditionSSOR preconditioner;              //    no convergence is very slow
-   // LA::PreconditionBDDC<dim> preconditioner;
-   // LA::PreconditionBlockJacobi preconditioner;       //    not working cause matrix has diagonal entries as 0 
-   // LA::PreconditionSOR preconditioner;               //    no convergence is very slow
-   preconditioner.initialize(vars.system_matrix);
+   SparseILU<double> preconditioner;
+   preconditioner.initialize(system_matrix);
 
-   solver.solve(vars.system_matrix, vars.solution, vars.system_rhs, preconditioner);
-   // solver.solve(vars.system_matrix, vars.solution, vars.system_rhs, preconditioner);
+   solver.solve(system_matrix, solution, system_rhs, LA::PreconditionNone());*/
 
-   phi_iteration = solver_control.last_step();
+   auto A = vars.system_matrix.petsc_matrix();
+   auto b = vars.system_rhs.petsc_vector();
+   auto x = vars.solution.petsc_vector();
+
+   KSP ksp;
+   PC  pc;
+   AssertPETSc(KSPCreate(MPI_COMM_WORLD, &ksp));
+   AssertPETSc(KSPSetType(ksp, KSPGMRES));
+   AssertPETSc(KSPGetPC(ksp, &pc));
+   // AssertPETSc(PCSetType(pc, PCJACOBI)); // works fine
+   // AssertPETSc(PCSetType(pc, PCILU)); // gives same error
+   AssertPETSc(PCSetType(pc, PCILU));
+   AssertPETSc(PCFactorReorderForNonzeroDiagonal(pc, 1e-6));
+   // AssertPETSc(PCSetType(pc, PCNONE));
+   // AssertPETSc(PCSetType(pc, PCHYPRE));
+   // AssertPETSc(PCHYPRESetType(pc, "ilu"));
+   AssertPETSc(KSPSetOperators(ksp, A, A));
+   AssertPETSc(KSPSetTolerances(ksp, 1e-6, PETSC_CURRENT, PETSC_CURRENT, 4000));
+   AssertPETSc(KSPGMRESSetRestart(ksp, 30));
+   AssertPETSc(KSPSetFromOptions(ksp));
+   AssertPETSc(KSPSetUp(ksp));
+   std::cout<< "helo fasdfasfd" << std::endl;
+   AssertPETSc(KSPSolve(ksp, b, x));
+   std::cout<< "helo fasdfasfd" << std::endl;
+   AssertPETSc(KSPGetIterationNumber(ksp, &phi_iteration));
+   AssertPETSc(KSPDestroy(&ksp));
+   timer.stop();
+
    j_iteration = 0;
    phi_time = timer.last_wall_time();
    j_time = 0.0;
+
+
+//------------------------------------------------------------------------------
+   // timer.start();
+   // SolverControl solver_control(3000, 1e-6 * vars.system_rhs.l2_norm());
+   // // SolverGMRES<LA::MPI::Vector>::AdditionalData additional_data;
+   // // additional_data.max_basis_size = 100;
+   // // SolverGMRES<LA::MPI::Vector> solver(solver_control, additional_data);
+   // // LA::SolverGMRES::AdditionalData additional_data;
+   // // additional_data.max_basis_size = 100;
+   // LA::SolverGMRES solver(solver_control);
+   //
+   // // TODO: Not able to use ILU with BlockMatrix/Vector
+   // // SparseILU<LA::MPI::SparseMatrix> preconditioner;
+   // //preconditioner.initialize(system_matrix);
+   // LA::PreconditionILU preconditioner;               //    not working cause matrix has diagonal entries as 0
+   // // LA::PreconditionLU preconditioner;                //    not working cause matrix has diagonal entries as 0
+   // // LA::PreconditionJacobi preconditioner;            //    working
+   // // LA::PreconditionBoomerAMG preconditioner;         //    no convergence
+   // // LA::PreconditionICC preconditioner;               //    not working cause matrix has diagonal entries as 0
+   // // LA::PreconditionParaSails preconditioner;         //    not working cause matrix not SPD
+   // // LA::PreconditionSSOR preconditioner;              //    no convergence is very slow
+   // // LA::PreconditionBDDC<dim> preconditioner;
+   // // LA::PreconditionBlockJacobi preconditioner;       //    not working cause matrix has diagonal entries as 0 
+   // // LA::PreconditionSOR preconditioner;               //    no convergence is very slow
+   // preconditioner.initialize(vars.system_matrix);
+   //
+   // solver.solve(vars.system_matrix, vars.solution, vars.system_rhs, preconditioner);
+   // // solver.solve(vars.system_matrix, vars.solution, vars.system_rhs, preconditioner);
+   //
+   // phi_iteration = solver_control.last_step();
+   // j_iteration = 0;
+   // phi_time = timer.last_wall_time();
+   // j_time = 0.0;
 }
 
 //------------------------------------------------------------------------------
