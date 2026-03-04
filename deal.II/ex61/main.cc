@@ -293,6 +293,8 @@ private:
    using PTriangulation = parallel::distributed::Triangulation<dim>;
 
    void make_grid(const unsigned int refine);
+   void setup_blockvar_system(const IndexSet &locally_owned_dofs, IndexSet & locally_relevant_dofs, const unsigned int &n_c, const unsigned int &n_p, Table<2, DoFTools::Coupling> &coupling);
+   void setup_var_system(const IndexSet &locally_owned_dofs, IndexSet & locally_relevant_dofs, Table<2, DoFTools::Coupling> &coupling);
    void setup_system();
    void assemble_system();
    void solve_schur(int&    phi_iteration,
@@ -387,6 +389,55 @@ MixedLaplaceProblem<dim>::make_grid(const unsigned int refine)
    }
 }
 
+//------------------------------------------------------------------------------
+template<int dim>
+void
+MixedLaplaceProblem<dim>::setup_blockvar_system(const IndexSet &locally_owned_dofs, IndexSet &locally_relevant_dofs, const unsigned int &n_c, const unsigned int &n_p, Table<2, DoFTools::Coupling>& coupling)
+{
+   std::vector<IndexSet>
+       owned_partitioning = {locally_owned_dofs.get_view(0, n_c),
+                             locally_owned_dofs.get_view(n_c, n_c + n_p)};
+   std::vector<IndexSet>
+      relevant_partitioning = {locally_relevant_dofs.get_view(0, n_c),
+                               locally_relevant_dofs.get_view(n_c, n_c + n_p)};
+
+   BlockDynamicSparsityPattern sparsity_pattern(relevant_partitioning);
+
+   DoFTools::make_sparsity_pattern(dof_handler,
+                                   coupling,
+                                   sparsity_pattern,
+                                   constraints,
+                                   false);
+   SparsityTools::distribute_sparsity_pattern(sparsity_pattern,
+                                              locally_owned_dofs,
+                                              MPI_COMM_WORLD,
+                                              locally_relevant_dofs);
+   block_vars.system_matrix.reinit(owned_partitioning,
+                        sparsity_pattern,
+                        MPI_COMM_WORLD);
+   block_vars.solution.reinit(owned_partitioning, MPI_COMM_WORLD);
+   block_vars.system_rhs.reinit(owned_partitioning, MPI_COMM_WORLD);;
+}
+//------------------------------------------------------------------------------
+template<int dim>
+void
+MixedLaplaceProblem<dim>::setup_var_system(const IndexSet &locally_owned_dofs, IndexSet &locally_relevant_dofs, Table<2, DoFTools::Coupling>& coupling)
+{
+   DynamicSparsityPattern sparsity_pattern(locally_relevant_dofs);
+   DoFTools::make_sparsity_pattern(dof_handler,
+                                   coupling,
+                                   sparsity_pattern,
+                                   constraints,
+                                   false);
+   SparsityTools::distribute_sparsity_pattern(sparsity_pattern,
+                                              locally_owned_dofs,
+                                              MPI_COMM_WORLD,
+                                              locally_relevant_dofs);
+   vars.system_matrix.reinit(locally_owned_dofs, locally_owned_dofs, sparsity_pattern,
+                        MPI_COMM_WORLD);
+   vars.solution.reinit(locally_owned_dofs, MPI_COMM_WORLD);
+   vars.system_rhs.reinit(locally_owned_dofs, MPI_COMM_WORLD);;
+}
 //------------------------------------------------------------------------------
 template<int dim>
 void
@@ -496,35 +547,12 @@ MixedLaplaceProblem<dim>::setup_system()
    coupling.fill(DoFTools::always);
    coupling(dim, dim) = DoFTools::none;
 
-   std::vector<IndexSet>
-       owned_partitioning = {locally_owned_dofs.get_view(0, n_c),
-                             locally_owned_dofs.get_view(n_c, n_c + n_p)};
-   std::vector<IndexSet>
-      relevant_partitioning = {locally_relevant_dofs.get_view(0, n_c),
-                               locally_relevant_dofs.get_view(n_c, n_c + n_p)};
-
-   BlockDynamicSparsityPattern sparsity_pattern(relevant_partitioning);
-
-   DoFTools::make_sparsity_pattern(dof_handler,
-                                   coupling,
-                                   sparsity_pattern,
-                                   constraints,
-                                   false);
-   SparsityTools::distribute_sparsity_pattern(sparsity_pattern,
-                                              locally_owned_dofs,
-                                              MPI_COMM_WORLD,
-                                              locally_relevant_dofs);
-
-   DynamicSparsityPattern sparsity_pattern_1(locally_relevant_dofs);
-   DoFTools::make_sparsity_pattern(dof_handler,
-                                   coupling,
-                                   sparsity_pattern_1,
-                                   constraints,
-                                   false);
-   SparsityTools::distribute_sparsity_pattern(sparsity_pattern_1,
-                                              locally_owned_dofs,
-                                              MPI_COMM_WORLD,
-                                              locally_relevant_dofs);
+   if(linear_solver == "schur")
+   {
+       setup_blockvar_system(locally_owned_dofs, locally_relevant_dofs,n_c,n_p, coupling);
+   }else{
+       setup_var_system(locally_owned_dofs, locally_relevant_dofs, coupling);
+    }
    // // sparsity_pattern_1.copy_from(sparsity_pattern);
    //
    // for(unsigned int i = 0; i < dof_handler.n_dofs(); ++i)
@@ -535,20 +563,6 @@ MixedLaplaceProblem<dim>::setup_system()
    //         sparsity_pattern_1.add(i, j);
    //     }
    // }
-
-   if(linear_solver == "schur")
-   {
-       block_vars.system_matrix.reinit(owned_partitioning,
-                            sparsity_pattern,
-                            MPI_COMM_WORLD);
-       block_vars.solution.reinit(owned_partitioning, MPI_COMM_WORLD);
-       block_vars.system_rhs.reinit(owned_partitioning, MPI_COMM_WORLD);;
-    } else {
-       vars.system_matrix.reinit(locally_owned_dofs, locally_owned_dofs, sparsity_pattern_1,
-                            MPI_COMM_WORLD);
-       vars.solution.reinit(locally_owned_dofs, MPI_COMM_WORLD);
-       vars.system_rhs.reinit(locally_owned_dofs, MPI_COMM_WORLD);;
-    }
 
    timer.stop();
    // double time_elapsed = timer.last_wall_time();
@@ -793,19 +807,17 @@ MixedLaplaceProblem<dim>::solve_gmres(int&    phi_iteration,
    AssertPETSc(KSPGetPC(ksp, &pc));
    // AssertPETSc(PCSetType(pc, PCJACOBI)); // works fine
    // AssertPETSc(PCSetType(pc, PCILU)); // gives same error
-   AssertPETSc(PCSetType(pc, PCILU));
-   AssertPETSc(PCFactorReorderForNonzeroDiagonal(pc, 1e-6));
+   // AssertPETSc(PCSetType(pc, PCILU));
+   // AssertPETSc(PCFactorReorderForNonzeroDiagonal(pc, 1e-6));
    // AssertPETSc(PCSetType(pc, PCNONE));
-   // AssertPETSc(PCSetType(pc, PCHYPRE));
+   AssertPETSc(PCSetType(pc, PCHYPRE));
    // AssertPETSc(PCHYPRESetType(pc, "ilu"));
    AssertPETSc(KSPSetOperators(ksp, A, A));
    AssertPETSc(KSPSetTolerances(ksp, 1e-6, PETSC_CURRENT, PETSC_CURRENT, 4000));
    AssertPETSc(KSPGMRESSetRestart(ksp, 30));
    AssertPETSc(KSPSetFromOptions(ksp));
    AssertPETSc(KSPSetUp(ksp));
-   std::cout<< "helo fasdfasfd" << std::endl;
    AssertPETSc(KSPSolve(ksp, b, x));
-   std::cout<< "helo fasdfasfd" << std::endl;
    AssertPETSc(KSPGetIterationNumber(ksp, &phi_iteration));
    AssertPETSc(KSPDestroy(&ksp));
    timer.stop();
