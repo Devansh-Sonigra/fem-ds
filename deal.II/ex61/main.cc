@@ -172,10 +172,11 @@ private:
 };
 
 //------------------------------------------------------------------------------
+template<typename MatrixType>
 class SchurMatrix
 {
 public:
-  SchurMatrix(const MassMatrixInverse & op_M, const LA::MPI::SparseMatrix &B, const LA::MPI::Vector &U)
+  SchurMatrix(const MatrixType & op_M, const LA::MPI::SparseMatrix &B, const LA::MPI::Vector &U)
     : op_M(op_M),
     B(B), 
     U(U)
@@ -194,29 +195,32 @@ public:
   }
 
 private:
-  const MassMatrixInverse & op_M;
+  const MatrixType & op_M;
   const LA::MPI::SparseMatrix &B;
   const LA::MPI::Vector &U;
 };
 //------------------------------------------------------------------------------
+template<typename MatrixType, typename PreconditionerType>
 class SchurMatrixInverse
 {
 public:
-  SchurMatrixInverse(SchurMatrix & op_S)
-    : op_S(op_S)
+  SchurMatrixInverse(SchurMatrix<MatrixType> & op_S, PreconditionerType & preconditioner, unsigned int iterations)
+    : op_S(op_S), preconditioner(preconditioner), iterations(iterations)
   {}
 
   void vmult(LA::MPI::Vector &dst,
              const LA::MPI::Vector &src) const
   {
 
-   SolverControl            solver_control_S(6000, 1.e-8);
+   SolverControl            solver_control_S(iterations, 1.e-8);
    SolverCG<LA::MPI::Vector> solver_S(solver_control_S);
-   solver_S.solve(op_S, dst, src, PreconditionIdentity());
+   solver_S.solve(op_S, dst, src, preconditioner);
   }
 
 private:
-  const SchurMatrix & op_S;
+  const SchurMatrix<MatrixType> & op_S;
+  PreconditionerType &preconditioner;
+  unsigned int iterations;
 };
 //------------------------------------------------------------------------------
 class ParameterReader : public EnableObserverPointer
@@ -711,7 +715,12 @@ MixedLaplaceProblem<dim>::solve_schur(int&    phi_iteration,
    // const auto op_M_inv = inverse_operator(op_M, solver_M, preconditioner_M);
 
    // const auto op_S = transpose_operator(op_B) * op_M_inv * op_B;
-   SchurMatrix op_S(op_M_inv, B, U);
+   SchurMatrix<MassMatrixInverse> op_S(op_M_inv, B, U);
+   SchurMatrix<LA::PreconditionJacobi> op_aS(preconditioner_M, B, U);
+  PreconditionIdentity identity;
+
+  // SchurMatrixInverse< SchurMatrix<LA::PreconditionJacobi>, PreconditionIdentity>op_aS_inv(op_aS, identity, 30);
+  SchurMatrixInverse op_aS_inv(op_aS, identity, 30);
    // const auto op_aS =
    //    transpose_operator(op_B) * linear_operator<LA::MPI::Vector>(preconditioner_M) * op_B;
    //
@@ -737,7 +746,7 @@ MixedLaplaceProblem<dim>::solve_schur(int&    phi_iteration,
    //
    timer.start();
    // P = op_S_inv * schur_rhs;
-   SchurMatrixInverse op_S_inv(op_S);
+   SchurMatrixInverse<MassMatrixInverse, SchurMatrixInverse<LA::PreconditionJacobi, PreconditionIdentity>> op_S_inv(op_S, op_aS_inv, 6000);
    op_S_inv.vmult(P, schur_rhs);
    timer.stop();
    // op_M_inv.vmult(P, P);
