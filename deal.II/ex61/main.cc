@@ -64,6 +64,8 @@
 #include <deal.II/numerics/data_postprocessor.h>
 #include <petscpctypes.h>
 #include <petscpc.h>
+#include <deal.II/base/conditional_ostream.h>
+#include <deal.II/base/mpi.h>
 
 #define AssertPETSc(code)                          \
    do                                              \
@@ -297,8 +299,8 @@ private:
    using PTriangulation = parallel::distributed::Triangulation<dim>;
 
    void make_grid(const unsigned int refine);
-   void setup_blockvar_system(const IndexSet &locally_owned_dofs, IndexSet & locally_relevant_dofs, const unsigned int &n_c, const unsigned int &n_p, Table<2, DoFTools::Coupling> &coupling);
-   void setup_var_system(const IndexSet &locally_owned_dofs, IndexSet & locally_relevant_dofs, Table<2, DoFTools::Coupling> &coupling);
+   void setup_blockvar_system();
+   void setup_var_system();
    void setup_system();
    template<typename VariableStruct> void assemble_system(VariableStruct &VarStruct);
    void solve_schur(int&    phi_iteration,
@@ -325,9 +327,12 @@ private:
                        double& j_err,
                        double& d_err,
                        VariableStruct &VarStruct);
-   template<typename VariableStruct>void output_results(unsigned int n,
-                                                        VariableStruct &VarStruct);
+   template<typename VariableStruct>void output_results(VariableStruct &VarStruct);
    void refine_grid(unsigned int refine);
+
+   MPI_Comm               mpi_comm;
+   const unsigned int     mpi_rank;
+   ConditionalOStream     pcout;
 
    const unsigned int degree;
    const unsigned int nrefine;
@@ -358,13 +363,15 @@ MixedLaplaceProblem<dim>::MixedLaplaceProblem(
       const unsigned int initial_refine,
       const double       perturb,
       const std::string  solver)
-   :
+ : mpi_comm(MPI_COMM_WORLD),
+   mpi_rank(Utilities::MPI::this_mpi_process(mpi_comm)),
+   pcout(std::cout, mpi_rank==0),
    degree(degree),
    nrefine(nrefine),
    initial_refine(initial_refine),
    perturb(perturb),
    linear_solver(solver),
-   triangulation(MPI_COMM_WORLD),
+   triangulation(mpi_comm),
    fe(FE_RaviartThomas<dim>(degree), FE_DGQ<dim>(degree)),
    dof_handler(triangulation)
 {}
@@ -379,7 +386,7 @@ MixedLaplaceProblem<dim>::make_grid(const unsigned int refine)
    triangulation.refine_global(refine);
 
    if(perturb <= 0.0) return;
-   std::cout << "Randomly perturbing grid with amplitude "
+   pcout << "Randomly perturbing grid with amplitude "
              << perturb << std::endl;
 
    // Randomly perturb the grid
@@ -402,58 +409,9 @@ MixedLaplaceProblem<dim>::make_grid(const unsigned int refine)
 //------------------------------------------------------------------------------
 template<int dim>
 void
-MixedLaplaceProblem<dim>::setup_blockvar_system(const IndexSet &locally_owned_dofs, IndexSet &locally_relevant_dofs, const unsigned int &n_c, const unsigned int &n_p, Table<2, DoFTools::Coupling>& coupling)
+MixedLaplaceProblem<dim>::setup_blockvar_system()
 {
-   std::vector<IndexSet>
-       owned_partitioning = {locally_owned_dofs.get_view(0, n_c),
-                             locally_owned_dofs.get_view(n_c, n_c + n_p)};
-   std::vector<IndexSet>
-      relevant_partitioning = {locally_relevant_dofs.get_view(0, n_c),
-                               locally_relevant_dofs.get_view(n_c, n_c + n_p)};
-
-   BlockDynamicSparsityPattern sparsity_pattern(relevant_partitioning);
-
-   DoFTools::make_sparsity_pattern(dof_handler,
-                                   coupling,
-                                   sparsity_pattern,
-                                   constraints,
-                                   false);
-   SparsityTools::distribute_sparsity_pattern(sparsity_pattern,
-                                              locally_owned_dofs,
-                                              MPI_COMM_WORLD,
-                                              locally_relevant_dofs);
-   block_vars.system_matrix.reinit(owned_partitioning,
-                        sparsity_pattern,
-                        MPI_COMM_WORLD);
-   block_vars.solution.reinit(owned_partitioning, MPI_COMM_WORLD);
-   block_vars.system_rhs.reinit(owned_partitioning, MPI_COMM_WORLD);;
-}
-//------------------------------------------------------------------------------
-template<int dim>
-void
-MixedLaplaceProblem<dim>::setup_var_system(const IndexSet &locally_owned_dofs, IndexSet &locally_relevant_dofs, Table<2, DoFTools::Coupling>& coupling)
-{
-   DynamicSparsityPattern sparsity_pattern(locally_relevant_dofs);
-   DoFTools::make_sparsity_pattern(dof_handler,
-                                   coupling,
-                                   sparsity_pattern,
-                                   constraints,
-                                   false);
-   SparsityTools::distribute_sparsity_pattern(sparsity_pattern,
-                                              locally_owned_dofs,
-                                              MPI_COMM_WORLD,
-                                              locally_relevant_dofs);
-   vars.system_matrix.reinit(locally_owned_dofs, locally_owned_dofs, sparsity_pattern,
-                        MPI_COMM_WORLD);
-   vars.solution.reinit(locally_owned_dofs, MPI_COMM_WORLD);
-   vars.system_rhs.reinit(locally_owned_dofs, MPI_COMM_WORLD);;
-}
-//------------------------------------------------------------------------------
-template<int dim>
-void
-MixedLaplaceProblem<dim>::setup_system()
-{
-   timer.start();
+    timer.start();
    dof_handler.distribute_dofs(fe);
 
    DoFRenumbering::component_wise(dof_handler);
@@ -463,7 +421,7 @@ MixedLaplaceProblem<dim>::setup_system()
    const unsigned int n_c = dofs_per_component[0],
                       n_p = dofs_per_component[dim];
 
-   std::cout << "Number of active cells: " << triangulation.n_active_cells()
+   pcout << "Number of active cells: " << triangulation.n_active_cells()
              << std::endl
              << "Total number of cells: " << triangulation.n_cells()
              << std::endl
@@ -556,12 +514,169 @@ MixedLaplaceProblem<dim>::setup_system()
    coupling.reinit(dim + 1, dim + 1);
    coupling.fill(DoFTools::always);
    coupling(dim, dim) = DoFTools::none;
+   std::vector<IndexSet>
+       owned_partitioning = {locally_owned_dofs.get_view(0, n_c),
+                             locally_owned_dofs.get_view(n_c, n_c + n_p)};
+   std::vector<IndexSet>
+      relevant_partitioning = {locally_relevant_dofs.get_view(0, n_c),
+                               locally_relevant_dofs.get_view(n_c, n_c + n_p)};
+
+   BlockDynamicSparsityPattern sparsity_pattern(relevant_partitioning);
+
+   DoFTools::make_sparsity_pattern(dof_handler,
+                                   coupling,
+                                   sparsity_pattern,
+                                   constraints,
+                                   false);
+   SparsityTools::distribute_sparsity_pattern(sparsity_pattern,
+                                              locally_owned_dofs,
+                                              mpi_comm,
+                                              locally_relevant_dofs);
+   block_vars.system_matrix.reinit(owned_partitioning,
+                        sparsity_pattern,
+                        mpi_comm);
+   block_vars.solution.reinit(owned_partitioning, relevant_partitioning, mpi_comm);
+   block_vars.system_rhs.reinit(owned_partitioning, mpi_comm);;
+   timer.stop();
+}
+//------------------------------------------------------------------------------
+template<int dim>
+void
+MixedLaplaceProblem<dim>::setup_var_system()
+{
+    timer.start();
+   dof_handler.distribute_dofs(fe);
+
+   // DoFRenumbering::component_wise(dof_handler);
+
+   // const std::vector<types::global_dof_index> dofs_per_component =
+   //    DoFTools::count_dofs_per_fe_component(dof_handler);
+   // const unsigned int n_c = dofs_per_component[0],
+   //                    n_p = dofs_per_component[dim];
+
+   pcout << "Number of active cells: " << triangulation.n_active_cells()
+             << std::endl
+             << "Total number of cells: " << triangulation.n_cells()
+             << std::endl
+             << "Number of degrees of freedom: " << dof_handler.n_dofs() <<std::endl;
+             // << " (" << n_c << '+' << n_p << ')' << std::endl;
+
+   const auto& locally_owned_dofs = dof_handler.locally_owned_dofs();
+   IndexSet locally_relevant_dofs =
+       DoFTools::extract_locally_relevant_dofs(dof_handler);
+
+   constraints.clear();
+   constraints.reinit(locally_owned_dofs, locally_relevant_dofs);
+
+#if PROBLEM == DIRICHLET
+   // p = 0 on all boundary
+   // Nothing to do, weakly imposed, just dont add any boundary integral.
+#else // Neumann problem: TODO
+   // J.n = 0 on all boundaries
+   VectorTools::project_boundary_values_div_conforming
+        (dof_handler,
+         0,
+         Functions::ZeroFunction<dim>(dim),
+         types::boundary_id(0),
+         constraints);
+
+   // Add mean value constraint on phi
+   Vector<double> integral_vector;
+   integral_vector.reinit(dof_handler.n_dofs());
+
+   const FEValuesExtractors::Scalar scalar_extractor(dim);
+   const ComponentMask scalar_mask = fe.component_mask(scalar_extractor);
+   std::vector<bool> bool_boundary_dofs;
+   DoFTools::extract_dofs_with_support_on_boundary(dof_handler,
+                                                   scalar_mask,
+                                                   bool_boundary_dofs,
+                                                   {0});
+
+   const IndexSet all_dofs = DoFTools::extract_dofs(dof_handler, scalar_mask);
+   types::global_dof_index first_dof = all_dofs.nth_index_in_set(0);
+
+   const QGauss < dim - 1 > quadrature_formula(degree + 2);
+   FEFaceValues<dim> face_fe_values(fe, quadrature_formula,
+                                    update_values | update_gradients |
+                                    update_quadrature_points |
+                                    update_JxW_values);
+
+   const unsigned int dofs_per_cell = fe.n_dofs_per_cell();
+   const unsigned int face_n_q_points = quadrature_formula.size();
+   Vector<double> local_rhs(dofs_per_cell);
+   std::vector<types::global_dof_index> local_dof_indices(dofs_per_cell);
+
+   for(const auto& cell : dof_handler.active_cell_iterators())
+   {
+      local_rhs = 0.0;
+      for(unsigned int f = 0; f < cell->n_faces(); ++f)
+      {
+         if(cell->face(f)->at_boundary())
+         {
+            face_fe_values.reinit(cell, f);
+            for(unsigned int q_point = 0; q_point < face_n_q_points; ++q_point)
+            {
+               for(unsigned int i = 0; i < dofs_per_cell; ++i)
+               {
+                  local_rhs(i) += face_fe_values[scalar_extractor].value(i, q_point) *
+                                  face_fe_values.JxW(q_point);
+               }
+            }
+         }
+      }
+      cell->get_dof_indices(local_dof_indices);
+      for(unsigned int i = 0; i < dofs_per_cell; ++i)
+      {
+         if(local_rhs(i) != 0)
+         {
+            integral_vector(local_dof_indices[i]) += local_rhs(i);
+         }
+      }
+   }
+
+   std::vector<std::pair<types::global_dof_index, double>> rhs;
+   for(const types::global_dof_index i : all_dofs)
+      if(i != first_dof && bool_boundary_dofs[i])
+         rhs.emplace_back(i, -integral_vector(i) / integral_vector(first_dof));
+   constraints.add_constraint(first_dof, rhs);
+#endif
+
+   constraints.close();
+
+   // Table<2, DoFTools::Coupling> coupling;
+   // coupling.reinit(dim + 1, dim + 1);
+   // coupling.fill(DoFTools::always);
+   // coupling(dim, dim) = DoFTools::none;
+   DynamicSparsityPattern sparsity_pattern(locally_relevant_dofs);
+   DoFTools::make_sparsity_pattern(dof_handler,
+                                   sparsity_pattern,
+                                   constraints,
+                                   false);
+   SparsityTools::distribute_sparsity_pattern(sparsity_pattern,
+                                              locally_owned_dofs,
+                                              mpi_comm,
+                                              locally_relevant_dofs);
+   vars.system_matrix.reinit(locally_owned_dofs, locally_owned_dofs, sparsity_pattern,
+                        mpi_comm);
+   // vars.solution.reinit(locally_owned_dofs, mpi_comm);
+   vars.system_rhs.reinit(locally_owned_dofs, mpi_comm);;
+   vars.solution.reinit(locally_owned_dofs, locally_relevant_dofs, mpi_comm);
+   // vars.system_rhs.reinit(locally_owned_dofs, locally_relevant_dofs, mpi_comm);;
+
+   timer.stop();
+}
+//------------------------------------------------------------------------------
+template<int dim>
+void
+MixedLaplaceProblem<dim>::setup_system()
+{
+   timer.start();
 
    if(linear_solver == "schur")
    {
-       setup_blockvar_system(locally_owned_dofs, locally_relevant_dofs,n_c,n_p, coupling);
+       setup_blockvar_system();
    }else{
-       setup_var_system(locally_owned_dofs, locally_relevant_dofs, coupling);
+       setup_var_system();
     }
    // // sparsity_pattern_1.copy_from(sparsity_pattern);
    //
@@ -677,8 +792,8 @@ MixedLaplaceProblem<dim>::assemble_system(VariableStruct &VarStruct)
    double time_elapsed = timer.last_wall_time();
 
    // TODO reduce h_max, aspect over all ranks
-   std::cout << "Largest cell aspect ratio = " << aspect << std::endl;
-   std::cout << "Time for assembly = " << time_elapsed << " sec\n";
+   pcout << "Largest cell aspect ratio = " << aspect << std::endl;
+   pcout << "Time for assembly = " << time_elapsed << " sec\n";
 }
 
 //------------------------------------------------------------------------------
@@ -696,8 +811,19 @@ MixedLaplaceProblem<dim>::solve_schur(int&    phi_iteration,
    const auto& F = block_vars.system_rhs.block(0);
    const auto& G = block_vars.system_rhs.block(1);
 
-   auto& U = block_vars.solution.block(0);
-   auto& P = block_vars.solution.block(1);
+   const std::vector<types::global_dof_index> dofs_per_component =
+      DoFTools::count_dofs_per_fe_component(dof_handler);
+   const unsigned int n_c = dofs_per_component[0],
+                      n_p = dofs_per_component[dim];
+   const auto& locally_owned_dofs = dof_handler.locally_owned_dofs();
+   std::vector<IndexSet>
+       owned_partitioning = {locally_owned_dofs.get_view(0, n_c),
+                             locally_owned_dofs.get_view(n_c, n_c + n_p)};
+   LA::MPI::BlockVector distributed_solution(owned_partitioning, mpi_comm);
+   // auto& U = block_vars.solution.block(0);
+   // auto& P = block_vars.solution.block(1);
+   auto & U = distributed_solution.block(0);
+   auto & P = distributed_solution.block(1);
 
    // TrilinosWrappers::SparseMatrix M_1;
 
@@ -762,7 +888,8 @@ MixedLaplaceProblem<dim>::solve_schur(int&    phi_iteration,
    tmp_1 -= F;
    tmp_1 *= -1;
    op_M_inv.vmult(U,tmp_1);
-   constraints.distribute(block_vars.solution);
+   constraints.distribute(distributed_solution);
+   block_vars.solution = distributed_solution;
    timer.stop();
    // j_iteration = reduction_control_M.last_step();
    j_iteration = 0;
@@ -782,8 +909,11 @@ MixedLaplaceProblem<dim>::solve_umfpack(int&    phi_iteration,
    SolverControl cn;
    LA::SparseDirectMUMPS solver(cn);
    // solver.initialize(vars.system_matrix);
-   solver.solve(vars.system_matrix, vars.solution, vars.system_rhs);
-   constraints.distribute(vars.solution);
+   LA::MPI::Vector distributed_solution(dof_handler.locally_owned_dofs(),
+                                mpi_comm);
+   solver.solve(vars.system_matrix, distributed_solution, vars.system_rhs);
+   constraints.distribute(distributed_solution);
+   vars.solution = distributed_solution;
    // */
    timer.stop();
 
@@ -818,7 +948,7 @@ MixedLaplaceProblem<dim>::solve_petsc_gmres(int&    phi_iteration,
 
    KSP ksp;
    PC  pc;
-   AssertPETSc(KSPCreate(MPI_COMM_WORLD, &ksp));
+   AssertPETSc(KSPCreate(mpi_comm, &ksp));
    AssertPETSc(KSPSetType(ksp, KSPGMRES));
    AssertPETSc(KSPGetPC(ksp, &pc));
    // AssertPETSc(PCSetType(pc, PCJACOBI)); // works fine
@@ -854,6 +984,8 @@ MixedLaplaceProblem<dim>::solve_gmres(int&    phi_iteration,
    timer.start();
    SolverControl solver_control(3000, 1e-6 * vars.system_rhs.l2_norm());
    LA::SolverGMRES solver(solver_control);
+   LA::MPI::Vector distributed_solution(dof_handler.locally_owned_dofs(),
+                                mpi_comm);
 
    // TODO: Not able to use ILU with BlockMatrix/Vector
    // SparseILU<LA::MPI::SparseMatrix> preconditioner;
@@ -872,7 +1004,11 @@ MixedLaplaceProblem<dim>::solve_gmres(int&    phi_iteration,
    preconditioner.initialize(vars.system_matrix);
 
    // solver.solve(vars.system_matrix, vars.solution, vars.system_rhs, preconditioner);
-   solver.solve(vars.system_matrix, vars.solution, vars.system_rhs, preconditioner);
+   // solver.solve(vars.system_matrix, vars.solution, vars.system_rhs, preconditioner);
+   solver.solve(vars.system_matrix, distributed_solution, vars.system_rhs, preconditioner);
+   constraints.distribute(distributed_solution);
+   vars.solution = distributed_solution;
+   timer.stop();
 
    phi_iteration = solver_control.last_step();
    j_iteration = 0;
@@ -897,7 +1033,7 @@ MixedLaplaceProblem<dim>::solve(int&    phi_iteration,
    else
       solve_gmres(phi_iteration, j_iteration, phi_time, j_time);
 
-   std::cout << "Time to solve (phi,j,total) = " << phi_time << ", " << j_time
+   pcout << "Time to solve (phi,j,total) = " << phi_time << ", " << j_time
              << ", " << phi_time + j_time << std::endl;
 }
 
@@ -966,9 +1102,13 @@ MixedLaplaceProblem<dim>::compute_errors(double& phi_err,
 template <int dim>
 template<typename VariableStruct>
 void
-MixedLaplaceProblem<dim>::output_results(unsigned int n, VariableStruct &VarStruct)
+MixedLaplaceProblem<dim>::output_results(VariableStruct &VarStruct)
 {
    timer.start();
+   static int step = 0;
+   static std::vector<std::pair<double, std::string>> pvtu_files;
+   const unsigned int n_digits_for_counter = 2;
+
    std::vector<std::string> solution_names(dim, "vector");
    solution_names.emplace_back("scalar");
    std::vector<DataComponentInterpretation::DataComponentInterpretation>
@@ -985,8 +1125,14 @@ MixedLaplaceProblem<dim>::output_results(unsigned int n, VariableStruct &VarStru
        Postprocessor<dim> div_j;
        data_out.add_data_vector(dof_handler, VarStruct.solution, div_j);
    data_out.build_patches(degree + 1);
-   std::ofstream output("solution_" + Utilities::int_to_string(n) + ".vtu");
-   data_out.write_vtu(output);
+   // std::ofstream output("solution_" + Utilities::int_to_string(n) + ".vtu");
+   // data_out.write_vtu(output);
+   data_out.write_vtu_with_pvtu_record("./", "sol", step, mpi_comm, n_digits_for_counter);
+   std::string fname = "sol_" + Utilities::int_to_string(step, n_digits_for_counter) + ".pvtu";
+   pvtu_files.emplace_back(step, fname);
+   std::ofstream pvd_file("sol.pvd");
+   DataOutBase::write_pvd_record(pvd_file, pvtu_files);
+   ++step;
 
    timer.stop();
    // double time_elapsed = timer.last_wall_time();
@@ -1012,7 +1158,7 @@ MixedLaplaceProblem<dim>::run(std::vector<int>&    ncell,
       timer.reset();
 
       make_grid(i + initial_refine);
-      std::cout << "---------------Grid level = " << i << "-----------------\n";
+      pcout << "---------------Grid level = " << i << "-----------------\n";
       setup_system();
 
       // Solve J,phi
@@ -1028,10 +1174,10 @@ MixedLaplaceProblem<dim>::run(std::vector<int>&    ncell,
       if(linear_solver == "schur")
       {
           compute_errors<BlockVariables>(phi_error[i], j_error[i], d_error[i], block_vars);
-          output_results<BlockVariables>(i, block_vars);
+          output_results<BlockVariables>(block_vars);
       } else {
           compute_errors<Variables>(phi_error[i], j_error[i], d_error[i], vars);
-          output_results<Variables>(i, vars);
+          output_results<Variables>(vars);
       }
 
 
@@ -1053,7 +1199,8 @@ main(int argc, char **argv)
    Utilities::MPI::MPI_InitFinalize mpi_initialization(argc, argv, 1);
    try
    {
-    std::cout << "Solving " << problem << " problem\n";
+   const auto rank = Utilities::MPI::this_mpi_process(MPI_COMM_WORLD);
+    if(rank == 0)   std::cout << "Solving " << problem << " problem\n";
 
     ParameterHandler prm;
     ParameterReader param(prm);
@@ -1062,7 +1209,7 @@ main(int argc, char **argv)
     unsigned int degree = prm.get_integer("degree");
     unsigned int nrefine = prm.get_integer("nrefine");
     unsigned int initial_refine = prm.get_integer("initial_refine");
-    std::cout << "Using FE = RT(" << degree << "), DG(" << degree << ")\n";
+    if (rank == 0)std::cout << "Using FE = RT(" << degree << "), DG(" << degree << ")\n";
 
     std::vector<int> ncell(nrefine),  p_dofs(nrefine), j_dofs(nrefine),
                      p_iterations(nrefine), j_iterations(nrefine);
@@ -1137,13 +1284,14 @@ main(int argc, char **argv)
       convergence_table.evaluate_convergence_rates
       ("error(d)", ConvergenceTable::reduction_rate_log2);
 
-      std::cout << std::endl;
+      if(rank == 0){std::cout << std::endl;
       convergence_table.write_text(std::cout);
 
       std::ofstream tex_file(problem + ".tex");
       convergence_table.write_tex(tex_file);
       std::ofstream text_file(problem + ".txt");
       convergence_table.write_text(text_file);
+    }
    }
 
    catch(std::exception& exc)
