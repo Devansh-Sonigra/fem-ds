@@ -214,15 +214,82 @@ public:
              const LA::MPI::Vector &src) const
   {
 
-   SolverControl            solver_control_S(iterations, 1.e-8);
+    SolverControl            solver_control_S(src.size(), 1.e-8);
    SolverCG<LA::MPI::Vector> solver_S(solver_control_S);
    solver_S.solve(op_S, dst, src, preconditioner);
+   // if (iterations != 30)
+   // {
+   //  SolverControl            solver_control_S(src.size(), 1.e-8);
+   // SolverCG<LA::MPI::Vector> solver_S(solver_control_S);
+   // solver_S.solve(op_S, dst, src, preconditioner);
+   // }
+   // else 
+   // {
+   //     IterationNumberControl  solver_control_S(iterations, 1.e-18);
+   //     SolverCG<LA::MPI::Vector> solver_S(solver_control_S);
+   //     solver_S.solve(op_S, dst, src, preconditioner);
+   // }
   }
 
 private:
   const SchurMatrix<MatrixType> & op_S;
   PreconditionerType &preconditioner;
   unsigned int iterations;
+};
+//------------------------------------------------------------------------------
+// template<LA::MPI::BlockSparseMatrix, LA::MPI::BlockVector>
+// template<typename MatrixType, typename PreconditionerType>
+class BlockSchurPreconditioner
+{
+public:
+  BlockSchurPreconditioner(LA::MPI::BlockSparseMatrix& A)
+      : A(A)
+  {}
+
+  void vmult(LA::MPI::BlockVector &dst,
+             const LA::MPI::BlockVector &src) const
+  {
+   const auto& M = A.block(0, 0);
+   const auto& B = A.block(0, 1);
+
+   const auto &U = src.block(0);
+   const auto &P = src.block(1);
+
+   auto &V = dst.block(0);
+   auto &Q = dst.block(1);
+
+   ReductionControl         reduction_control_M(2000, 1.0e-18, 1.0e-10);
+   LA::SolverCG solver_M(reduction_control_M);
+   LA::PreconditionJacobi preconditioner_M;
+
+   preconditioner_M.initialize(M);
+
+   SchurMatrix<LA::PreconditionJacobi> op_aS(preconditioner_M, B, U);
+  PreconditionIdentity identity;
+  SchurMatrixInverse op_aS_inv(op_aS, identity, 30);
+
+  preconditioner_M.vmult(V, U);
+  LA::MPI::Vector tmp_1;
+  tmp_1.reinit(U);
+
+  preconditioner_M.vmult(tmp_1, V);
+
+  LA::MPI::Vector tmp_2;
+  tmp_2.reinit(P);
+  B.Tvmult(tmp_2, tmp_1);
+
+  LA::MPI::Vector tmp_3;
+  tmp_3.reinit(P);
+  op_aS_inv.vmult(tmp_3, tmp_2);
+
+
+  op_aS_inv.vmult(Q, P);
+  Q *= -1;
+  Q += tmp_3;
+  }
+
+private:
+  LA::MPI::BlockSparseMatrix &A;
 };
 //------------------------------------------------------------------------------
 class ParameterReader : public EnableObserverPointer
@@ -672,7 +739,7 @@ MixedLaplaceProblem<dim>::setup_system()
 {
    timer.start();
 
-   if(linear_solver == "schur")
+   if(linear_solver == "schur" || linear_solver == "gmres")
    {
        setup_blockvar_system();
    }else{
@@ -762,7 +829,7 @@ MixedLaplaceProblem<dim>::assemble_system(VariableStruct &VarStruct)
       }
 
       cell->get_dof_indices(local_dof_indices);
-      // if(linear_solver == "schur")
+      // if(linear_solver == "schur" || linear_solver == "gmres")
       // {
       // constraints.distribute_local_to_global(local_matrix,
       //                                        local_rhs,
@@ -779,7 +846,7 @@ MixedLaplaceProblem<dim>::assemble_system(VariableStruct &VarStruct)
                                              VarStruct.system_rhs);
       // }
    }
-   // if(linear_solver == "schur")
+   // if(linear_solver == "schur" || linear_solver == "gmres")
    // {
    //     block_vars.system_matrix.compress(VectorOperation::add);
    //     block_vars.system_rhs.compress(VectorOperation::add);
@@ -982,32 +1049,60 @@ MixedLaplaceProblem<dim>::solve_gmres(int&    phi_iteration,
                     double& j_time)
 {
    timer.start();
-   SolverControl solver_control(3000, 1e-6 * vars.system_rhs.l2_norm());
-   LA::SolverGMRES solver(solver_control);
-   LA::MPI::Vector distributed_solution(dof_handler.locally_owned_dofs(),
-                                mpi_comm);
-
-   // TODO: Not able to use ILU with BlockMatrix/Vector
-   // SparseILU<LA::MPI::SparseMatrix> preconditioner;
-   //preconditioner.initialize(system_matrix);
-   // LA::PreconditionILU preconditioner;               //    not working cause matrix has diagonal entries as 0
-   // LA::PreconditionLU preconditioner;                //    not working cause matrix has diagonal entries as 0
-   LA::PreconditionJacobi preconditioner;            //    working
-   // LA::PreconditionBoomerAMG preconditioner;         //    no convergence
-   // LA::PreconditionICC preconditioner;               //    not working cause matrix has diagonal entries as 0
-   // LA::PreconditionParaSails preconditioner;         //    not working cause matrix not SPD
-   // LA::PreconditionSSOR preconditioner;              //    no convergence is very slow
-   // LA::PreconditionBDDC<dim> preconditioner;
-   // LA::PreconditionBlockJacobi preconditioner;       //    not working cause matrix has diagonal entries as 0 
-   // LA::PreconditionSOR preconditioner;               //    no convergence is very slow
-   // LA::PreconditionNone preconditioner;
-   preconditioner.initialize(vars.system_matrix);
+   // SolverControl solver_control(3000, 1e-6 * vars.system_rhs.l2_norm());
+   // LA::SolverGMRES solver(solver_control);
+   // LA::MPI::Vector distributed_solution(dof_handler.locally_owned_dofs(),
+   //                              mpi_comm);
+   //
+   // // TODO: Not able to use ILU with BlockMatrix/Vector
+   // // SparseILU<LA::MPI::SparseMatrix> preconditioner;
+   // //preconditioner.initialize(system_matrix);
+   // // LA::PreconditionILU preconditioner;               //    not working cause matrix has diagonal entries as 0
+   // // LA::PreconditionLU preconditioner;                //    not working cause matrix has diagonal entries as 0
+   // LA::PreconditionJacobi preconditioner;            //    working
+   // // LA::PreconditionBoomerAMG preconditioner;         //    no convergence
+   // // LA::PreconditionICC preconditioner;               //    not working cause matrix has diagonal entries as 0
+   // // LA::PreconditionParaSails preconditioner;         //    not working cause matrix not SPD
+   // // LA::PreconditionSSOR preconditioner;              //    no convergence is very slow
+   // // LA::PreconditionBDDC<dim> preconditioner;
+   // // LA::PreconditionBlockJacobi preconditioner;       //    not working cause matrix has diagonal entries as 0 
+   // // LA::PreconditionSOR preconditioner;               //    no convergence is very slow
+   // // LA::PreconditionNone preconditioner;
+   // preconditioner.initialize(vars.system_matrix);
 
    // solver.solve(vars.system_matrix, vars.solution, vars.system_rhs, preconditioner);
    // solver.solve(vars.system_matrix, vars.solution, vars.system_rhs, preconditioner);
-   solver.solve(vars.system_matrix, distributed_solution, vars.system_rhs, preconditioner);
+   // solver.solve(vars.system_matrix, distributed_solution, vars.system_rhs, preconditioner);
+   // constraints.distribute(distributed_solution);
+   // vars.solution = distributed_solution;
+
+   // pcout << 1e-4* block_vars.system_rhs.l2_norm() <<std::endl;
+   SolverControl solver_control(3000, 1e-8 * block_vars.system_rhs.l2_norm());
+   SolverGMRES<LA::MPI::BlockVector> solver(solver_control);
+
+
+   const std::vector<types::global_dof_index> dofs_per_component =
+      DoFTools::count_dofs_per_fe_component(dof_handler);
+   const unsigned int n_c = dofs_per_component[0],
+                      n_p = dofs_per_component[dim];
+
+   const auto& locally_owned_dofs = dof_handler.locally_owned_dofs();
+   IndexSet locally_relevant_dofs =
+       DoFTools::extract_locally_relevant_dofs(dof_handler);
+
+   std::vector<IndexSet>
+       owned_partitioning = {locally_owned_dofs.get_view(0, n_c),
+                             locally_owned_dofs.get_view(n_c, n_c + n_p)};
+   std::vector<IndexSet>
+      relevant_partitioning = {locally_relevant_dofs.get_view(0, n_c),
+                               locally_relevant_dofs.get_view(n_c, n_c + n_p)};
+   LA::MPI::BlockVector distributed_solution(owned_partitioning, relevant_partitioning, mpi_comm);
+
+   BlockSchurPreconditioner bsp(block_vars.system_matrix);
+   solver.solve(block_vars.system_matrix, distributed_solution, block_vars.system_rhs, bsp);
+   // solver.solve(block_vars.system_matrix, distributed_solution, block_vars.system_rhs, PreconditionIdentity());
    constraints.distribute(distributed_solution);
-   vars.solution = distributed_solution;
+   block_vars.solution = distributed_solution;
    timer.stop();
 
    phi_iteration = solver_control.last_step();
@@ -1162,7 +1257,7 @@ MixedLaplaceProblem<dim>::run(std::vector<int>&    ncell,
       setup_system();
 
       // Solve J,phi
-      if(linear_solver == "schur")
+      if(linear_solver == "schur" || linear_solver == "gmres")
       {
          assemble_system<BlockVariables>(block_vars);
       } else {
@@ -1171,7 +1266,7 @@ MixedLaplaceProblem<dim>::run(std::vector<int>&    ncell,
 
       solve(phi_iterations[i], j_iterations[i], phi_time[i], j_time[i]);
 
-      if(linear_solver == "schur")
+      if(linear_solver == "schur" || linear_solver == "gmres")
       {
           compute_errors<BlockVariables>(phi_error[i], j_error[i], d_error[i], block_vars);
           output_results<BlockVariables>(block_vars);
