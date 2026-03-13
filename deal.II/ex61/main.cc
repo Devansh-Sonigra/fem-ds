@@ -58,6 +58,8 @@
 #include <deal.II/fe/fe_raviart_thomas.h>
 
 #include <deal.II/lac/trilinos_sparse_matrix.h>
+#include <deal.II/lac/vector.h>
+#include <deal.II/lac/vector_operation.h>
 #include <deal.II/numerics/vector_tools.h>
 #include <deal.II/numerics/data_out.h>
 #include <deal.II/numerics/matrix_tools.h>
@@ -150,30 +152,33 @@ Postprocessor<dim>::Postprocessor()
 {}
 
 //------------------------------------------------------------------------------
+template<typename PreconditionerType>
 class MassMatrixInverse
 {
 public:
-  MassMatrixInverse(const LA::MPI::SparseMatrix &M_in)
-    : M(M_in)
+  MassMatrixInverse(const LA::MPI::SparseMatrix &M_in, SolverCG<LA::MPI::Vector> &solver, PreconditionerType& preconditioner)
+    : M(M_in), solver(solver), preconditioner(preconditioner)
   {}
 
-  mutable int solve_iter;
+  // mutable int solve_iter;
   
   void vmult(LA::MPI::Vector &dst,
              const LA::MPI::Vector &src) const
   {
-    ReductionControl reduction_control(2000, 1e-18, 1e-10);
-    SolverCG<LA::MPI::Vector> solver(reduction_control);
-
-    LA::PreconditionJacobi preconditioner;
-    preconditioner.initialize(M);
+    // ReductionControl reduction_control(2000, 1e-18, 1e-10);
+    // SolverCG<LA::MPI::Vector> solver(reduction_control);
+    //
+    // LA::PreconditionJacobi preconditioner;
+    // preconditioner.initialize(M);
 
     solver.solve(M, dst, src, preconditioner);
-    solve_iter = reduction_control.last_step();
+    // solve_iter = reduction_control.last_step();
   }
 
 private:
   const LA::MPI::SparseMatrix &M;
+  SolverCG<LA::MPI::Vector> &solver;
+  PreconditionerType& preconditioner;
 };
 
 //------------------------------------------------------------------------------
@@ -278,67 +283,39 @@ private:
 // };
 //------------------------------------------------------------------------------
 // template<LA::MPI::BlockSparseMatrix, LA::MPI::BlockVector>
-// template<typename MatrixType, typename PreconditionerType>
+template<typename MatrixType, typename PreconditionerType>
+// template<typename PreconditionerType>
 class BlockSchurPreconditioner
 {
 public:
-  BlockSchurPreconditioner(LA::MPI::BlockSparseMatrix& A)
-      : A(A)
+  BlockSchurPreconditioner(LA::MPI::SparseMatrix& B, PreconditionerType &preconditioner_M, MatrixType &op_aS_inv)
+      : B(B), preconditioner_M(preconditioner_M), op_aS_inv(op_aS_inv)
   {}
 
   void vmult(LA::MPI::BlockVector &dst,
              const LA::MPI::BlockVector &src) const
   {
-   const auto& M = A.block(0, 0);
-   const auto& B = A.block(0, 1);
+   const auto &b_1 = src.block(0);
+   const auto &b_2 = src.block(1);
 
-   const auto &U = src.block(0);
-   const auto &P = src.block(1);
+   auto &y_1 = dst.block(0);
+   auto &y_2 = dst.block(1);
 
-   auto &V = dst.block(0);
-   auto &Q = dst.block(1);
-
-   // ReductionControl         reduction_control_M(2000, 1.0e-18, 1.0e-10);
-   // SolverCG<LA::MPI::Vector> solver_M(reduction_control_M);
-   LA::PreconditionJacobi preconditioner_M;
-   // LA::PreconditionParaSails preconditioner_M;
-
-   preconditioner_M.initialize(M);
-
-   SchurMatrix<LA::PreconditionJacobi> op_aS(preconditioner_M, B, U);
-   // SchurMatrix<LA::PreconditionParaSails> op_aS(preconditioner_M, B, U);
-  PreconditionIdentity identity;
-  // int iterations = 30;
-  IterationNumberControl iterations(30, 1e-18);
-  SchurMatrixInverse op_aS_inv(op_aS, identity, iterations);
-
-  preconditioner_M.vmult(V, U);
+  preconditioner_M.vmult(y_1, b_1);
   
   LA::MPI::Vector tmp_1;
-  tmp_1.reinit(P);
-  B.Tvmult(tmp_1, V);
-  tmp_1.add(-1, P);
-  op_aS_inv.vmult(Q, tmp_1);
-  //
-  // preconditioner_M.vmult(tmp_1, U);
-  // // preconditioner_M.vmult(tmp_1, V);
-  //
-  // LA::MPI::Vector tmp_2;
-  // tmp_2.reinit(P);
-  // B.Tvmult(tmp_2, tmp_1);
-  //
-  // LA::MPI::Vector tmp_3;
-  // tmp_3.reinit(P);
-  // op_aS_inv.vmult(tmp_3, tmp_2);
-  //
-  //
-  // op_aS_inv.vmult(Q, P);
-  // Q *= -1;
-  // Q += tmp_3;
+  tmp_1.reinit(b_2);
+  B.Tvmult(tmp_1, y_1);
+  tmp_1.add(-1.0, b_2);
+  // tmp_1.sadd(-1.0, 1.0, P);
+  // tmp_1 -= P;
+  op_aS_inv.vmult(y_2, tmp_1);
   }
 
 private:
-  LA::MPI::BlockSparseMatrix &A;
+  LA::MPI::SparseMatrix &B;
+  PreconditionerType &preconditioner_M;
+  MatrixType & op_aS_inv;
 };
 //------------------------------------------------------------------------------
 class ParameterReader : public EnableObserverPointer
@@ -556,6 +533,7 @@ MixedLaplaceProblem<dim>::setup_blockvar_system()
    // Nothing to do, weakly imposed, just dont add any boundary integral.
 #else // Neumann problem: TODO
    // J.n = 0 on all boundaries
+   pcout << "hello 1" << std::endl;
    VectorTools::project_boundary_values_div_conforming
         (dof_handler,
          0,
@@ -570,10 +548,12 @@ MixedLaplaceProblem<dim>::setup_blockvar_system()
    const FEValuesExtractors::Scalar scalar_extractor(dim);
    const ComponentMask scalar_mask = fe.component_mask(scalar_extractor);
    std::vector<bool> bool_boundary_dofs;
+   pcout << "hello 2" << std::endl;
    DoFTools::extract_dofs_with_support_on_boundary(dof_handler,
                                                    scalar_mask,
                                                    bool_boundary_dofs,
                                                    {0});
+   pcout << "hello 2" << std::endl;
 
    const IndexSet all_dofs = DoFTools::extract_dofs(dof_handler, scalar_mask);
    types::global_dof_index first_dof = all_dofs.nth_index_in_set(0);
@@ -589,7 +569,9 @@ MixedLaplaceProblem<dim>::setup_blockvar_system()
    Vector<double> local_rhs(dofs_per_cell);
    std::vector<types::global_dof_index> local_dof_indices(dofs_per_cell);
 
+   pcout << "hello 3" << std::endl;
    for(const auto& cell : dof_handler.active_cell_iterators())
+       if(cell -> is_locally_owned())
    {
       local_rhs = 0.0;
       for(unsigned int f = 0; f < cell->n_faces(); ++f)
@@ -616,11 +598,13 @@ MixedLaplaceProblem<dim>::setup_blockvar_system()
          }
       }
    }
+   pcout << "hello 4" << std::endl;
 
    std::vector<std::pair<types::global_dof_index, double>> rhs;
    for(const types::global_dof_index i : all_dofs)
       if(i != first_dof && bool_boundary_dofs[i])
          rhs.emplace_back(i, -integral_vector(i) / integral_vector(first_dof));
+   pcout << "hello 5" << std::endl;
    constraints.add_constraint(first_dof, rhs);
 #endif
 
@@ -759,12 +743,13 @@ MixedLaplaceProblem<dim>::setup_var_system()
 
    constraints.close();
 
-   // Table<2, DoFTools::Coupling> coupling;
-   // coupling.reinit(dim + 1, dim + 1);
-   // coupling.fill(DoFTools::always);
-   // coupling(dim, dim) = DoFTools::none;
+   Table<2, DoFTools::Coupling> coupling;
+   coupling.reinit(dim + 1, dim + 1);
+   coupling.fill(DoFTools::always);
+   coupling(dim, dim) = DoFTools::none;
    DynamicSparsityPattern sparsity_pattern(locally_relevant_dofs);
    DoFTools::make_sparsity_pattern(dof_handler,
+                                   coupling,
                                    sparsity_pattern,
                                    constraints,
                                    false);
@@ -952,12 +937,14 @@ MixedLaplaceProblem<dim>::solve_schur(int&    phi_iteration,
    LA::PreconditionJacobi preconditioner_M;
 
    preconditioner_M.initialize(M);
+    ReductionControl reduction_control(2000, 1e-18, 1e-10);
+    SolverCG<LA::MPI::Vector> solver(reduction_control);
 
-   MassMatrixInverse op_M_inv(M);
+   MassMatrixInverse<LA::PreconditionJacobi> op_M_inv(M,solver, preconditioner_M);
    // const auto op_M_inv = inverse_operator(op_M, solver_M, preconditioner_M);
 
    // const auto op_S = transpose_operator(op_B) * op_M_inv * op_B;
-   SchurMatrix<MassMatrixInverse> op_S(op_M_inv, B, U);
+   SchurMatrix<MassMatrixInverse<LA::PreconditionJacobi>> op_S(op_M_inv, B, U);
    SchurMatrix<LA::PreconditionJacobi> op_aS(preconditioner_M, B, U);
   PreconditionIdentity identity;
 
@@ -991,7 +978,8 @@ MixedLaplaceProblem<dim>::solve_schur(int&    phi_iteration,
    timer.start();
    // P = op_S_inv * schur_rhs;
   SolverControl solver_control_S(3000, 1e-8);
-   SchurMatrixInverse<MassMatrixInverse, SchurMatrixInverse<LA::PreconditionJacobi, PreconditionIdentity, IterationNumberControl>, SolverControl> op_S_inv(op_S, op_aS_inv, solver_control_S);
+   // SchurMatrixInverse<MassMatrixInverse, SchurMatrixInverse<LA::PreconditionJacobi, PreconditionIdentity, IterationNumberControl>, SolverControl> op_S_inv(op_S, op_aS_inv, solver_control_S);
+   SchurMatrixInverse op_S_inv(op_S, op_aS_inv, solver_control_S);
    op_S_inv.vmult(P, schur_rhs);
    timer.stop();
    // op_M_inv.vmult(P, P);
@@ -1011,8 +999,8 @@ MixedLaplaceProblem<dim>::solve_schur(int&    phi_iteration,
    constraints.distribute(distributed_solution);
    block_vars.solution = distributed_solution;
    timer.stop();
-   // j_iteration = reduction_control_M.last_step();
-   j_iteration = op_M_inv.solve_iter;
+   j_iteration = reduction_control.last_step();
+   // j_iteration = op_M_inv.solve_iter;
    j_time = timer.last_wall_time();
    
 }
@@ -1164,7 +1152,47 @@ MixedLaplaceProblem<dim>::solve_gmres(int&    phi_iteration,
    //                             locally_relevant_dofs.get_view(n_c, n_c + n_p)};
    LA::MPI::BlockVector distributed_solution(owned_partitioning, mpi_comm);
 
-   BlockSchurPreconditioner bsp(block_vars.system_matrix);
+   // Preconditioner
+   const auto& M = block_vars.system_matrix.block(0, 0);
+   const auto& B = block_vars.system_matrix.block(0, 1);
+
+   const auto & U = block_vars.system_rhs.block(0);
+
+   // LA::PreconditionJacobi preconditioner_M;
+   LA::PreconditionLU preconditioner_M;
+   preconditioner_M.initialize(M);
+   
+   //--------------------------------------------------------------------------------------
+   // LA::MPI::Vector tmp(U);
+   // LA::MPI::Vector tmp_2(U);
+   // LA::MPI::Vector tmp_3(U);
+   // tmp = 0;
+   // tmp(0) = 1;
+   // tmp(1) = 0.5;
+   // tmp.compress(VectorOperation::insert);
+   // M.vmult(tmp_2, tmp);
+   // pcout << tmp.l2_norm() << std::endl;
+   // preconditioner_M.vmult(tmp_3, tmp_2);
+   // pcout << "hllo" << std::endl;
+   // tmp_3.add(-1, tmp);
+   // double tmp_1 = tmp_3.l2_norm() / tmp.l2_norm();
+   // pcout << tmp_1 << std::endl;
+   //--------------------------------------------------------------------------------------
+
+
+   // const auto &U = block_vars.system_rhs.block(0);
+
+   // SchurMatrix<LA::PreconditionJacobi> op_aS(preconditioner_M, B, U);
+   SchurMatrix<LA::PreconditionLU> op_aS(preconditioner_M, B, U);
+
+  PreconditionIdentity identity;
+  // int iterations = 30;
+  // IterationNumberControl iterations(30, 1e-18);
+   SolverControl iterations(3000, 1e-7);
+  SchurMatrixInverse op_aS_inv(op_aS, identity, iterations);
+
+   // BlockSchurPreconditioner<SchurMatrixInverse<SchurMatrix<LA::PreconditionJacobi>, PreconditionIdentity, IterationNumberControl>, LA::PreconditionJacobi> bsp(block_vars.system_matrix.block(0,1), preconditioner_M, op_aS_inv);
+   BlockSchurPreconditioner bsp(block_vars.system_matrix.block(0,1), preconditioner_M, op_aS_inv);
    solver.solve(block_vars.system_matrix, distributed_solution, block_vars.system_rhs, bsp);
    // solver.solve(block_vars.system_matrix, distributed_solution, block_vars.system_rhs, PreconditionIdentity());
    constraints.distribute(distributed_solution);

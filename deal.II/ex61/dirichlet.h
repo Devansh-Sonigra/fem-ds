@@ -21,13 +21,29 @@ namespace PrescribedSolution
    {
       const double x = p[0];
       const double y = p[1];
-      const double cx = cos(2 * pi * x);
-      const double sx = sin(2 * pi * x);
-      const double cy = cos(2 * pi * y);
-      const double sy = sin(2 * pi * y);
-      value[0] = 2 * pi * cx * sy;
-      value[1] = 2 * pi * sx * cy;
-      value[2] = sx * sy;
+      const double b = 2 * pi;
+      const double cx = cos(b * x);
+      const double sx = sin(b * x);
+      const double cy = cos(b * y);
+      const double sy = sin(b * y);
+
+      const double cc = cx * cy;
+      const double cs = cx * sy;
+      const double sc = sx * cy;
+      const double ss = sx * sy;
+      const double exp_xy = exp(x + y);
+
+      // value[0] = 2 * pi * cx * sy;
+      // value[1] = 2 * pi * sx * cy;
+      // value[2] = sx * sy;
+
+      // value[0] = (sx + b * x * cx) * y * sy;
+      // value[1] = (sy + b * y * cy) * x * sx;
+      // value[2] = x *  y * sx * sy;
+
+      value[0] = exp_xy * (b * cs + ss); 
+      value[1] = exp_xy * (b * sc + ss);
+      value[2] = exp_xy * ss;
    }
 
    template <>
@@ -36,21 +52,46 @@ namespace PrescribedSolution
    {
       const double x = p[0];
       const double y = p[1];
-      const double cx = cos(2 * pi * x);
-      const double sx = sin(2 * pi * x);
-      const double cy = cos(2 * pi * y);
-      const double sy = sin(2 * pi * y);
-      const double a  = pow(2 * pi, 2);
       const double b  = 2 * pi;
+      const double cx = cos(b * x);
+      const double sx = sin(b * x);
+      const double cy = cos(b * y);
+      const double sy = sin(b * y);
+      const double a  = pow(2 * pi, 2);
 
-      value[0][0] = -a * sx * sy;
-      value[0][1] =  a * cx * cy;
+      const double cc = cx * cy;
+      const double cs = cx * sy;
+      const double sc = sx * cy;
+      const double ss = sx * sy;
+      const double exp_xy = exp(x + y);
+      // value[0][0] = -a * sx * sy;
+      // value[0][1] =  a * cx * cy;
+      //
+      // value[1][0] =  a * cx * cy;
+      // value[1][1] = -a * sx * sy;
+      //
+      // value[2][0] = b * cx * sy;
+      // value[2][1] = b * cy * sx;
 
-      value[1][0] =  a * cx * cy;
-      value[1][1] = -a * sx * sy;
+      // value[0][0] = b * (2 * cx  - b * x * sx) * y * sy;
+      // value[0][1] = (sx + b * x * cx) * (sy + b * y * cy);
+      //
+      // // value[1][0] = (sx + b * x * cx) * (sy + b * y * cy);
+      // value[1][0] = value[0][1];
+      // value[1][1] = b * (2 * cy - b * y * sy) * x * sx;
+      //
+      // value[2][0] = (sx + b * x * cx) * y * sy;
+      // value[2][1] = (sy + b * y * cy) * x * sx;
 
-      value[2][0] = b * cx * sy;
-      value[2][1] = b * sx * cy;
+      value[0][0] = exp_xy * (( -b * b + 1) * ss + 2 * b * cs);
+      value[0][1] = exp_xy * (b * b * cc + 2 * b * cs + ss);
+
+      // value[1][0] = (sx + b * x * cx) * (sy + b * y * cy);
+      value[1][0] = value[0][1];
+      value[1][1] = exp_xy * ((-b * b + 1) * ss + 2 * b * sc);
+
+      value[2][0] = exp_xy * (b * cs + ss);
+      value[2][1] = exp_xy * (b * sc + ss);
    }
 
    //---------------------------------------------------------------------------
@@ -69,6 +110,23 @@ namespace PrescribedSolution
    double RHSFunction<2>::value(const Point<2> &p,
                                 const unsigned int /*component*/) const
    {
-      return 8 * pi * pi * sin(2 * pi * p[0]) * sin(2 * pi * p[1]);
+      // return 8 * pi * pi * sin(2 * pi * p[0]) * sin(2 * pi * p[1]);
+      // return -2 * pi * ( (2 * cos(2 * pi * p[0]) - 2 * pi * p[0] * sin(2 * pi * p[0])) * p[1] * sin(2 * pi * p[1]) + (2 * cos(2 * pi * p[1]) - 2 * pi * p[1] * sin(2 * pi * p[1])) * p[0] * sin(2 * pi * p[0]));
+      const double x = p[0];
+      const double y = p[1];
+      const double b  = 2 * pi;
+      const double cx = cos(b * x);
+      const double sx = sin(b * x);
+      const double cy = cos(b * y);
+      const double sy = sin(b * y);
+      const double a  = pow(2 * pi, 2);
+
+      const double cc = cx * cy;
+      const double cs = cx * sy;
+      const double sc = sx * cy;
+      const double ss = sx * sy;
+      const double exp_xy = exp(x + y);
+
+      return -(exp_xy * (( -b * b + 1) * ss + 2 * b * cs) + exp_xy * ((-b * b + 1) * ss + 2 * b * sc));
    }
 } // namespace PrescribedSolution
