@@ -1,0 +1,11 @@
+-ksp_type minres
+-ksp_view
+-ksp_monitor
+-pc_type fieldsplit
+-pc_fieldsplit_type schur
+-pc_fieldsplit_schur_fact_type diag
+-fieldsplit_0_ksp_type preonly
+-fieldsplit_0_pc_type jacobi
+-fieldsplit_1_ksp_type cg
+-fieldsplit_1_ksp_rtol 1e-2
+-fieldsplit_1_pc_type none

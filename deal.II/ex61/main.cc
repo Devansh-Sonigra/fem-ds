@@ -64,10 +64,18 @@
 #include <deal.II/numerics/data_out.h>
 #include <deal.II/numerics/matrix_tools.h>
 #include <deal.II/numerics/data_postprocessor.h>
+#include <petscksp.h>
+#include <petscdmplex.h>
+#include <petscdmswarm.h>
+#include <petscmat.h>
+#include <petscsnes.h>
+#include <petscds.h>
 #include <petscpctypes.h>
 #include <petscpc.h>
 #include <deal.II/base/conditional_ostream.h>
 #include <deal.II/base/mpi.h>
+#include <petscsys.h>
+#include <petscvec.h>
 
 #define AssertPETSc(code)                          \
    do                                              \
@@ -533,7 +541,6 @@ MixedLaplaceProblem<dim>::setup_blockvar_system()
    // Nothing to do, weakly imposed, just dont add any boundary integral.
 #else // Neumann problem: TODO
    // J.n = 0 on all boundaries
-   pcout << "hello 1" << std::endl;
    VectorTools::project_boundary_values_div_conforming
         (dof_handler,
          0,
@@ -541,71 +548,66 @@ MixedLaplaceProblem<dim>::setup_blockvar_system()
          types::boundary_id(0),
          constraints);
 
-   // Add mean value constraint on phi
-   Vector<double> integral_vector;
-   integral_vector.reinit(dof_handler.n_dofs());
-
-   const FEValuesExtractors::Scalar scalar_extractor(dim);
-   const ComponentMask scalar_mask = fe.component_mask(scalar_extractor);
-   std::vector<bool> bool_boundary_dofs;
-   pcout << "hello 2" << std::endl;
-   DoFTools::extract_dofs_with_support_on_boundary(dof_handler,
-                                                   scalar_mask,
-                                                   bool_boundary_dofs,
-                                                   {0});
-   pcout << "hello 2" << std::endl;
-
-   const IndexSet all_dofs = DoFTools::extract_dofs(dof_handler, scalar_mask);
-   types::global_dof_index first_dof = all_dofs.nth_index_in_set(0);
-
-   const QGauss < dim - 1 > quadrature_formula(degree + 2);
-   FEFaceValues<dim> face_fe_values(fe, quadrature_formula,
-                                    update_values | update_gradients |
-                                    update_quadrature_points |
-                                    update_JxW_values);
-
-   const unsigned int dofs_per_cell = fe.n_dofs_per_cell();
-   const unsigned int face_n_q_points = quadrature_formula.size();
-   Vector<double> local_rhs(dofs_per_cell);
-   std::vector<types::global_dof_index> local_dof_indices(dofs_per_cell);
-
-   pcout << "hello 3" << std::endl;
-   for(const auto& cell : dof_handler.active_cell_iterators())
-       if(cell -> is_locally_owned())
-   {
-      local_rhs = 0.0;
-      for(unsigned int f = 0; f < cell->n_faces(); ++f)
-      {
-         if(cell->face(f)->at_boundary())
-         {
-            face_fe_values.reinit(cell, f);
-            for(unsigned int q_point = 0; q_point < face_n_q_points; ++q_point)
-            {
-               for(unsigned int i = 0; i < dofs_per_cell; ++i)
-               {
-                  local_rhs(i) += face_fe_values[scalar_extractor].value(i, q_point) *
-                                  face_fe_values.JxW(q_point);
-               }
-            }
-         }
-      }
-      cell->get_dof_indices(local_dof_indices);
-      for(unsigned int i = 0; i < dofs_per_cell; ++i)
-      {
-         if(local_rhs(i) != 0)
-         {
-            integral_vector(local_dof_indices[i]) += local_rhs(i);
-         }
-      }
-   }
-   pcout << "hello 4" << std::endl;
-
-   std::vector<std::pair<types::global_dof_index, double>> rhs;
-   for(const types::global_dof_index i : all_dofs)
-      if(i != first_dof && bool_boundary_dofs[i])
-         rhs.emplace_back(i, -integral_vector(i) / integral_vector(first_dof));
-   pcout << "hello 5" << std::endl;
-   constraints.add_constraint(first_dof, rhs);
+   // // Add mean value constraint on phi
+   // Vector<double> integral_vector;
+   // integral_vector.reinit(dof_handler.n_dofs());
+   //
+   // const FEValuesExtractors::Scalar scalar_extractor(dim);
+   // const ComponentMask scalar_mask = fe.component_mask(scalar_extractor);
+   // std::vector<bool> bool_boundary_dofs;
+   // DoFTools::extract_dofs_with_support_on_boundary(dof_handler,
+   //                                                 scalar_mask,
+   //                                                 bool_boundary_dofs,
+   //                                                 {0});
+   //
+   // const IndexSet all_dofs = DoFTools::extract_dofs(dof_handler, scalar_mask);
+   // types::global_dof_index first_dof = all_dofs.nth_index_in_set(0);
+   //
+   // const QGauss < dim - 1 > quadrature_formula(degree + 2);
+   // FEFaceValues<dim> face_fe_values(fe, quadrature_formula,
+   //                                  update_values | update_gradients |
+   //                                  update_quadrature_points |
+   //                                  update_JxW_values);
+   //
+   // const unsigned int dofs_per_cell = fe.n_dofs_per_cell();
+   // const unsigned int face_n_q_points = quadrature_formula.size();
+   // Vector<double> local_rhs(dofs_per_cell);
+   // std::vector<types::global_dof_index> local_dof_indices(dofs_per_cell);
+   //
+   // for(const auto& cell : dof_handler.active_cell_iterators())
+   //     if(cell -> is_locally_owned())
+   // {
+   //    local_rhs = 0.0;
+   //    for(unsigned int f = 0; f < cell->n_faces(); ++f)
+   //    {
+   //       if(cell->face(f)->at_boundary())
+   //       {
+   //          face_fe_values.reinit(cell, f);
+   //          for(unsigned int q_point = 0; q_point < face_n_q_points; ++q_point)
+   //          {
+   //             for(unsigned int i = 0; i < dofs_per_cell; ++i)
+   //             {
+   //                local_rhs(i) += face_fe_values[scalar_extractor].value(i, q_point) *
+   //                                face_fe_values.JxW(q_point);
+   //             }
+   //          }
+   //       }
+   //    }
+   //    cell->get_dof_indices(local_dof_indices);
+   //    for(unsigned int i = 0; i < dofs_per_cell; ++i)
+   //    {
+   //       if(local_rhs(i) != 0)
+   //       {
+   //          integral_vector(local_dof_indices[i]) += local_rhs(i);
+   //       }
+   //    }
+   // }
+   //
+   // std::vector<std::pair<types::global_dof_index, double>> rhs;
+   // for(const types::global_dof_index i : all_dofs)
+   //    if(i != first_dof && bool_boundary_dofs[i])
+   //       rhs.emplace_back(i, -integral_vector(i) / integral_vector(first_dof));
+   // constraints.add_constraint(first_dof, rhs);
 #endif
 
    constraints.close();
@@ -773,7 +775,8 @@ MixedLaplaceProblem<dim>::setup_system()
 {
    timer.start();
 
-   if(linear_solver == "schur" || linear_solver == "gmres")
+   if(linear_solver == "schur" || linear_solver == "gmres" || linear_solver == "petsc_gmres")
+   // if(linear_solver == "schur" || linear_solver == "gmres") 
    {
        setup_blockvar_system();
    }else{
@@ -863,7 +866,7 @@ MixedLaplaceProblem<dim>::assemble_system(VariableStruct &VarStruct)
       }
 
       cell->get_dof_indices(local_dof_indices);
-      // if(linear_solver == "schur" || linear_solver == "gmres")
+      // if(linear_solver == "schur" || linear_solver == "gmres" || linear_solver == "petsc_gmres")
       // {
       // constraints.distribute_local_to_global(local_matrix,
       //                                        local_rhs,
@@ -880,7 +883,7 @@ MixedLaplaceProblem<dim>::assemble_system(VariableStruct &VarStruct)
                                              VarStruct.system_rhs);
       // }
    }
-   // if(linear_solver == "schur" || linear_solver == "gmres")
+   // if(linear_solver == "schur" || linear_solver == "gmres" || linear_solver == "petsc_gmres")
    // {
    //     block_vars.system_matrix.compress(VectorOperation::add);
    //     block_vars.system_rhs.compress(VectorOperation::add);
@@ -1050,44 +1053,117 @@ MixedLaplaceProblem<dim>::solve_petsc_gmres(int&    phi_iteration,
 
    solver.solve(system_matrix, solution, system_rhs, LA::PreconditionNone());*/
 
-   auto A = vars.system_matrix.petsc_matrix();
-   auto b = vars.system_rhs.petsc_vector();
+   auto A = block_vars.system_matrix.petsc_matrix();
+   auto b = block_vars.system_rhs.petsc_vector();
    // auto x = vars.solution.petsc_vector();
 
-   LA::MPI::Vector distributed_solution;
-   distributed_solution.reinit(dof_handler.locally_owned_dofs(), mpi_comm);
+   const std::vector<types::global_dof_index> dofs_per_component =
+      DoFTools::count_dofs_per_fe_component(dof_handler);
+   const unsigned int n_c = dofs_per_component[0],
+                      n_p = dofs_per_component[dim];
+   const auto& locally_owned_dofs = dof_handler.locally_owned_dofs();
+   std::vector<IndexSet>
+       owned_partitioning = {locally_owned_dofs.get_view(0, n_c),
+                             locally_owned_dofs.get_view(n_c, n_c + n_p)};
+   LA::MPI::BlockVector distributed_solution(owned_partitioning, mpi_comm);
    auto x = distributed_solution.petsc_vector();
 
    KSP ksp;
    PC  pc;
    AssertPETSc(KSPCreate(mpi_comm, &ksp));
-   AssertPETSc(KSPSetType(ksp, KSPGMRES));
+   // AssertPETSc(KSPSetType(ksp, KSPGMRES));
+   AssertPETSc(KSPSetOperators(ksp, A, A));
    AssertPETSc(KSPGetPC(ksp, &pc));
+   #if PROBLEM == DIRICHLET
+       // Do nothing
+   #else 
+       // Applying null space constraints
+       MatNullSpace nullspace;
+       LA::MPI::BlockVector nullvec(owned_partitioning, mpi_comm);
+       // LA::MPI::BlockVector temp(owned_partitioning, mpi_comm);
+
+       nullvec.block(1) = 1.0;
+       // nullvec = 1.0;
+       nullvec /= nullvec.l2_norm();
+       nullvec.compress(VectorOperation::insert);
+       // block_vars.system_matrix.vmult(temp, nullvec);
+       // pcout << temp.l2_norm() << " hello" << std::endl;
+       auto y =  nullvec.petsc_vector();
+
+       AssertPETSc(MatNullSpaceCreate(mpi_comm, PETSC_FALSE, 1, &y, &nullspace));
+       AssertPETSc(MatNullSpaceRemove(nullspace, b));
+       AssertPETSc(MatSetNullSpace(A, nullspace));
+       AssertPETSc(MatNullSpaceDestroy(&nullspace));
+   #endif
+
+
+   // AssertPETSc(PCSetType(pc, PCFIELDSPLIT));
    // AssertPETSc(PCSetType(pc, PCJACOBI)); // works fine
    // AssertPETSc(PCSetType(pc, PCILU)); // gives same error
    // AssertPETSc(PCSetType(pc, PCILU));
    // AssertPETSc(PCSetType(pc, PCNONE));
-   AssertPETSc(PCFactorReorderForNonzeroDiagonal(pc, 1e-6));
-   AssertPETSc(PCSetType(pc, PCHYPRE));
-   AssertPETSc(PCHYPRESetType(pc, "euclid"));
+   // AssertPETSc(PCFactorReorderForNonzeroDiagonal(pc, 1e-6));
+
+   // AssertPETSc(PCSetType(pc, PCHYPRE));
+   // AssertPETSc(PCHYPRESetType(pc, "euclid"));
+
    // AssertPETSc(PCHYPRESetType(pc, "ilu"));
    // AssertPETSc(PCHYPRESetType(pc, "pilut"));
+
+   // AssertPETSc(PCSetType(pc, PCFIELDSPLIT));
+   // AssertPETSc(PCFieldSplitSetType(pc, PC_COMPOSITE_SCHUR));
+   // AssertPETSc(PCFieldSplitSetSchurFactType(pc, PC_FIELDSPLIT_SCHUR_FACT_LOWER));
+   // PetscInt nsplits = 2;
+   // KSP *sub_ksp;
+   // AssertPETSc(KSPCreate(mpi_comm, sub_ksp));
+   // PC pc_0, pc_1;
+   // // AssertPETSc(PCFieldSplitGetSubKSP(pc, 2, &sub_ksp));
+   // AssertPETSc(PCFieldSplitGetSubKSP(pc, &nsplits, &sub_ksp));
+   //
+   // AssertPETSc(KSPSetType(sub_ksp[0], KSPPREONLY));
+   // AssertPETSc(KSPGetPC(sub_ksp[0], &pc_0));
+   // AssertPETSc(PCSetType(pc_0, PCILU));
+   //
+   // AssertPETSc(KSPSetType(sub_ksp[1], KSPCG));
+   // AssertPETSc(KSPGetPC(sub_ksp[1], &pc_1));
+   // AssertPETSc(KSPSetTolerances(sub_ksp[1], 1e-2));
+   // AssertPETSc(PCSetType(pc_1, PCNONE));
 
    // AssertPETSc(PCView(pc, PETSC_VIEWER_STDOUT_WORLD));
    // AssertPETSc(PetscOptionsSetValue(nullptr, "-pc_hypre_euclid_level", "0")); 
    // AssertPETSc(PetscOptionsSetValue(nullptr, "-pc_hypre_ilu_level", "0")); 
-   AssertPETSc(KSPSetOperators(ksp, A, A));
-   AssertPETSc(KSPSetTolerances(ksp, 1e-6, PETSC_CURRENT, PETSC_CURRENT, 4000));
+   AssertPETSc(KSPSetTolerances(ksp, 1e-8, PETSC_CURRENT, PETSC_CURRENT, 4000));
    AssertPETSc(KSPGMRESSetRestart(ksp, 30));
+   const char *file = "petsc_options.txt";
+   AssertPETSc(PetscOptionsInsertFile(mpi_comm, NULL, file, PETSC_TRUE));
    AssertPETSc(KSPSetFromOptions(ksp));
    AssertPETSc(KSPSetUp(ksp));
    AssertPETSc(KSPSolve(ksp, b, x));
+
+   {
+        KSPConvergedReason reason;
+
+        AssertPETSc(KSPGetConvergedReason(ksp, &reason));
+        pcout << "Reason for convergence or divergence: " << reason << std::endl;
+        // PetscCheck(reason >= 0, PETSC_COMM_WORLD, PETSC_ERR_CONV_FAILED, "Linear solve failed");
+   }
    AssertPETSc(KSPGetIterationNumber(ksp, &phi_iteration));
    AssertPETSc(KSPDestroy(&ksp));
    timer.stop();
 
    constraints.distribute(distributed_solution);
-   vars.solution = distributed_solution;
+
+   // const double mean_p = distributed_solution.mean_value();
+   // distributed_solution.add(-mean_p);
+   block_vars.solution = distributed_solution;
+   block_vars.solution.compress(VectorOperation::insert);
+   // block_vars.solution.compress(VectorOperation::insert);
+   
+   // const double mean_p = VectorTools::compute_mean_value(dof_handler,
+   //                                                        QGauss<dim>(fe.degree+1),
+   //                                                        block_vars.solution, // or just pressure part
+   //                                                        dim); // component index of pressure
+   // pcout << mean_p << std::endl;
 
    j_iteration = 0;
    phi_time = timer.last_wall_time();
@@ -1351,7 +1427,8 @@ MixedLaplaceProblem<dim>::run(std::vector<int>&    ncell,
       setup_system();
 
       // Solve J,phi
-      if(linear_solver == "schur" || linear_solver == "gmres")
+      if(linear_solver == "schur" || linear_solver == "gmres" || linear_solver == "petsc_gmres")
+      // if(linear_solver == "schur" || linear_solver == "gmres") 
       {
          assemble_system<BlockVariables>(block_vars);
       } else {
@@ -1360,7 +1437,8 @@ MixedLaplaceProblem<dim>::run(std::vector<int>&    ncell,
 
       solve(phi_iterations[i], j_iterations[i], phi_time[i], j_time[i]);
 
-      if(linear_solver == "schur" || linear_solver == "gmres")
+      if(linear_solver == "schur" || linear_solver == "gmres" || linear_solver == "petsc_gmres")
+      // if(linear_solver == "schur" || linear_solver == "gmres") 
       {
           compute_errors<BlockVariables>(phi_error[i], j_error[i], d_error[i], block_vars);
           output_results<BlockVariables>(block_vars);
